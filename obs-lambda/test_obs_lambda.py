@@ -9,8 +9,13 @@ os.environ['LOCAL_RUN'] = 'True'
 os.environ['LOG_LEVEL'] = 'DEBUG'
 
 # Set any required environment variables
-os.environ['INTERNAL_BUCKET_NAME'] = ""
+os.environ['INTERNAL_BUCKET_NAME'] = "synoptic-ingest-hongkong-hko726"
 
+# Point to local tunnel endpoints
+os.environ['POE_SOCKET_ADDRESS'] = 'localhost' 
+os.environ['POE_SOCKET_PORT'] = '18095' 
+os.environ['METAMGR_SOCKET_ADDRESS'] = 'localhost'
+os.environ['METAMGR_SOCKET_PORT'] = '18888'
 # Must load these AFTER setting Args above
 from obs_lambda_handler import main
 from args import args

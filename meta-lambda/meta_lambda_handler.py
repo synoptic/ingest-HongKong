@@ -19,6 +19,8 @@ from ingestlib import station_lookup, parse, core
 import math
 import posixpath
 import re, unicodedata
+from bs4 import BeautifulSoup
+
 ########################################################################################################################
 # OVERVIEW
 ########################################################################################################################
@@ -50,24 +52,116 @@ import re, unicodedata
 ########################################################################################################################
 # DEFINE CONSTANTS
 ########################################################################################################################
-INGEST_NAME = #TODO Update Ingest Name
+INGEST_NAME = "hongkong" #TODO Update Ingest Name
 M_TO_FEET = 3.28084
 ELEVATION_UNIT = 'METERS' # ELEVATION UNIT OF THIS INGESTS METADATA MUST BE EITHER 'METERS' OR 'FEET'. METAMOTH CURRENTLY STORES ELEVATION IN FEET, SO WE WILL CONVERT IF IT'S IN METERS. 
-MNET_ID = # CREATE NEW MNET_ID FOR THIS INGEST
-MNET_SHORTNAME = #TODO add the mnet shortname
+MNET_ID = 342 # CREATE NEW MNET_ID FOR THIS INGEST
+MNET_SHORTNAME = "hongkong" #TODO add the mnet shortname
 RESTRICTED_DATA_STATUS = False # True or False, IS THE DATA RESTRICTED?
 RESTRICTED_METADATA_STATUS = False # True or False, IS THE METADATA RESTRICTED?
-STID_PREFIX = #TODO add the stid prefix
+STID_PREFIX = "HKI" #TODO add the stid prefix
 
 ########################################################################################################################
 # DEFINE LOGS
 ########################################################################################################################
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
+# Assume core.setup_logging is available
+# from ingestlib import core
 
-########################################################################################################################
-# DEFINE ETL/PARSING FUNCTIONS
-########################################################################################################################
+# --------- Helper: Fetch HKO station metadata dynamically ---------
+def fetch_hko_station_metadata_raw():
+    out = {}
 
+    url = "https://www.hko.gov.hk/en/cis/stn.htm"
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[HKO FETCH] Failed to fetch {url}: {e}")
+        return out
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    tables = soup.find_all("table")
+
+    for table in tables:
+        rows = table.find_all("tr")
+
+        if len(rows) < 2:
+            continue
+
+        for row in rows[1:]:
+            cols = row.find_all("td")
+
+            if len(cols) < 4:
+                continue
+
+            try:
+                name_cell = cols[0].get_text(strip=True)
+
+                # Extract station code inside ()
+                match = re.search(r"\((.*?)\)", name_cell)
+                if not match:
+                    continue
+
+                code = match.group(1)
+                name = name_cell.split("(")[0].strip()
+
+                lat_raw = cols[1].get_text(strip=True)
+                lon_raw = cols[2].get_text(strip=True)
+                elev_raw = cols[3].get_text(strip=True)
+
+                lat = _dms_to_decimal(lat_raw)
+                lon = _dms_to_decimal(lon_raw)
+
+                if lat is None or lon is None:
+                    continue
+
+                elevation = None
+                try:
+                    elevation = float(elev_raw)
+                except:
+                    pass
+
+                out[code] = {
+                    "NAME": name,
+                    "LAT": lat,
+                    "LON": lon,
+                    "OTID": code,
+                    "ELEVATION": elevation,
+                }
+
+            except Exception as e:
+                print(f"[HKO PARSE] Skipping row due to error: {e}")
+                continue
+
+    print(f"[HKO FETCH] Scraped {len(out)} stations from HTML")
+    return out
+
+def _dms_to_decimal(dms_str):
+    try:
+        dms_str = dms_str.strip()
+
+        match = re.match(r"(\d+)[°d]\s*(\d+)?['′]?\s*(\d+)?[\"″]?\s*([NSEW])?", dms_str)
+        if not match:
+            return None
+
+        degrees = float(match.group(1))
+        minutes = float(match.group(2)) if match.group(2) else 0.0
+        seconds = float(match.group(3)) if match.group(3) else 0.0
+        direction = match.group(4)
+
+        decimal = degrees + minutes / 60 + seconds / 3600
+
+        if direction in ['S', 'W']:
+            decimal *= -1
+
+        return round(decimal, 6)
+
+    except:
+        return None     
+# --------- Generate metadata payload (from your existing code) ---------
 def generate_metadata_payload(station_meta, payload_type, source_info=None):
     """
     Generates the metadata payload for ingestlib station lookup
@@ -228,6 +322,7 @@ def main(event,context):
         station_meta_file = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
         # Load Existing Stations and Payload Files
+        existing_stations = {}
         try:
             aws.S3.download_file(bucket=s3_bucket_name, object_key=s3_station_meta_file, local_directory=work_dir)
             with open(station_meta_file, 'r', encoding='utf-8') as json_file:
@@ -240,16 +335,33 @@ def main(event,context):
         ########################################################################################################################
         # Fetch Metadata
         ########################################################################################################################
-        # --------------- 2. RAW METADATA COLLECTION (if not collected already by obs lambda) ---------------
-        # Fetch initial metadata as raw_meta variable, ideally this is from a metadata specific endpoint, although it's possible this doesn't exist...
-        
-        raw_data = #TODO fetch the raw metadata if apt
-        # --------------- 3. METADATA PROCESSING ---------------
-        station_meta = #TODO parse the raw data to something that generate_metadata_payload() can process
+        raw_data = fetch_hko_station_metadata_raw()
 
-        # --------------- 4. STATION LOOKUP PAYLOAD CREATION ---------------
+        # Build station_meta dict
+        station_meta = {}
+        for station_id, info in raw_data.items():
+            existing = existing_stations.get(station_id, {})
+            station_meta[station_id] = {
+                "SYNOPTIC_STID": existing.get("SYNOPTIC_STID") or f"{STID_PREFIX}{station_id}",
+                "NAME": info["NAME"],
+                "LAT": info["LAT"],
+                "LON": info["LON"],
+                "OTID": info["OTID"],
+                "ELEVATION": info.get("ELEVATION"),
+                "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
+                "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS,
+            }
+
+        # Generate payload
         station_lookup_payload = generate_metadata_payload(station_meta=station_meta, payload_type='station_lookup')
 
+        # Save locally and upload to S3 (mocked here)
+        # save_to_json(station_meta, local_meta_path)
+        # aws.S3.upload_file(...)
+
+        # Further processing...
+
+        #print(f"Completed in {time.time() - start_time} seconds")
         # SAVE TO LOCAL DEV (if local_run)
         if args.local_run:
             dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../dev'))
@@ -323,6 +435,7 @@ def main(event,context):
 
         logger.info(msg=json.dumps({'completion': 1, 'time': time.time() - start_runtime}))
         
+
     except Exception as e:
         logger.error(msg=json.dumps({'completion': 0, 'time': time.time() - start_runtime}))
         raise 
