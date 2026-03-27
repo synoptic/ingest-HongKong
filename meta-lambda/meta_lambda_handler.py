@@ -1,13 +1,11 @@
 import csv
-import re
 import requests
 from io import StringIO
 from datetime import datetime, timedelta
-from ingestlib import aws
+from ingestlib import aws, station_lookup, parse, core
 import sys, os
 import ssl
 import certifi
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from enum import IntEnum
@@ -15,7 +13,6 @@ import boto3
 import json
 import logging
 import time
-from ingestlib import station_lookup, parse, core
 import math
 import posixpath
 import re, unicodedata
@@ -24,30 +21,16 @@ from bs4 import BeautifulSoup
 ########################################################################################################################
 # OVERVIEW
 ########################################################################################################################
-
-# This script handles metadata processing for new data ingests. The goal is to get metadata into metamoth. Key considerations:
-#
-# Metadata Sources:
-# - Provider metadata endpoint (preferred): Allows pre-compilation/validation of STIDs before observation ingestion
-# - Observation ingest script: Metadata extracted during observation processing
-#
-# STID Management:
-# - Critical to maintain unique STIDs
-# - Once created, STIDs must never be rewritten
-# - Careful handling required when creating STIDs during observation processing to avoid POE receiving STIDs that don't exist in metamoth.
-#
-# Process Flow:
-# 1. Define Constants (Elevation Unit, MNET ID, etc.)
-# 1. Collect raw metadata (source-dependent)
-# 2. Validate/ensure unique STIDs that DON'T get overwritten/edited
-# 3. Parse station details (lat, lon, elevation, other_id)
-# 4. Insert into database via:
-#    - Metamanager (preferred method)
-#    - Station lookup (backup method)
-#
-# Output:
-# - Creates SQL for metadata database insertion
-# - Updates stations_metadata.json
+# Hong Kong station metadata ingest.
+# - The station metadata JSON ALREADY EXISTS in S3. We MUST download it every run.
+# - We MUST NOT default existing_stations to {} (that masks load failures and causes overwrites).
+# - We merge fetched stations INTO the existing station_meta:
+#     - Never overwrite SYNOPTIC_STID once set.
+#     - Update mutable fields (NAME/LAT/LON/OTID/ELEVATION).
+#     - Never delete stations just because they didn't appear in today's scrape.
+# - Then generate station_lookup payload and run station_lookup.load_metamgr.
+# - Persist merged station_meta back to S3 and upload generated SQL files.
+########################################################################################################################
 
 ########################################################################################################################
 # DEFINE CONSTANTS
@@ -60,6 +43,8 @@ MNET_SHORTNAME = "hongkong" #TODO add the mnet shortname
 RESTRICTED_DATA_STATUS = False # True or False, IS THE DATA RESTRICTED?
 RESTRICTED_METADATA_STATUS = False # True or False, IS THE METADATA RESTRICTED?
 STID_PREFIX = "HKI" #TODO add the stid prefix
+
+HKO_STATION_URL = "https://www.hko.gov.hk/en/cis/stn.htm"
 
 ########################################################################################################################
 # DEFINE LOGS
@@ -140,6 +125,7 @@ def fetch_hko_station_metadata_raw():
     return out
 
 def _dms_to_decimal(dms_str):
+    """Convert a DMS (degrees/minutes/seconds) coordinate string to decimal degrees."""
     try:
         dms_str = dms_str.strip()
 
@@ -162,6 +148,10 @@ def _dms_to_decimal(dms_str):
     except:
         return None     
 # --------- Generate metadata payload (from your existing code) ---------
+
+########################################################################################################################
+# PAYLOAD GENERATION
+########################################################################################################################
 def generate_metadata_payload(station_meta, payload_type, source_info=None):
     """
     Generates the metadata payload for ingestlib station lookup
@@ -178,7 +168,7 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
         raise ValueError("Invalid payload_type. Must be 'station_lookup' or 'metamanager'.")
 
     metadata = []
-    
+
     for station_id, row in station_meta.items():
         try:
             # Extract required fields from the row

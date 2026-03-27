@@ -11,160 +11,130 @@
 # for example, here is a key from the variables dict used in the nasa globe ingest
 
 variables = {
-    "grass_min_temp": {
-        "vargem": "GSMN",    # Grass Surface Minimum (temperature)
+    "air_temp": {
+        "vargem": "TMPF",
         "VNUM": "1",
-        "long_name": "Daily Grass Minimum Temperature",
+        "long_name": "Air Temperature (1-minute)",
         "incoming_unit": "degC",
         "final_unit": "degC",
-        "context": "min",
-        "statistic": "24h"
+        "context": "mean",
+        "statistic": "1min"
     },
-#    "mean_cloud": {
-#        "vargem": "CHC1",    # CLouD Cover
-#        "VNUM": "1",
-#        "long_name": "Daily Mean Amount of Cloud",
-#        "incoming_unit": "oktas",
-#        "final_unit": "code",
-#        "context": "mean",
-#        "statistic": "10min"
-#    },
-    "total_rainfall": {
-        "vargem": "P24I",    # PreCiPitatioN
+    "relative_humidity": {
+        "vargem": "RELH",
         "VNUM": "1",
-        "long_name": "Daily Total Rainfall",
-        "incoming_unit": "mm",
-        "final_unit": "mm",
-        "context": "sum",
-        "statistic": "24h"
-    },
-    "mean_humidity": {
-        "vargem": "RELH",    # RELative Humidity
-        "VNUM": "1",
-        "long_name": "Daily Mean Relative Humidity",
+        "long_name": "Relative Humidity (1-minute)",
         "incoming_unit": "pct",
         "final_unit": "pct",
         "context": "mean",
-        "statistic": "24h"
+        "statistic": "1min"
     },
-
-# How to report?    
-    "max_mean_min_temp": {
-        "vargem": "TMPF",    # TeMPerature (air, dry-bulb)
-        "VNUM": "1",         # column 2 = daily mean; col 1 = max; col 3 = min
-        "long_name": "Daily Mean Air Temperature",
-        "incoming_unit": "degC",
-        "final_unit": "degC",
-        "context": "mean",
-        "statistic": "24h"
-    },
-
-#    "mean_sea_temp": {
-#        "vargem": "",    # Mean Sea Surface Temperature
-#        "VNUM": "1",
-#        "long_name": "Daily Mean Sea Temperature",
-#        "incoming_unit": "degC",
-#        "final_unit": "degC",
-#        "context": "mean",
-#        "statistic": "10min"
-#    },
-#    "visibility_hours": {
-#        "vargem": "VSBY",    # VISiBility (hours of reduced)
-#        "VNUM": "1",
-#        "long_name": "Daily Number of Hours of Reduced Visibility",
-#        "incoming_unit": "hours",
-#        "final_unit": "hours",
-#        "context": "mean",
-#        "statistic": "10min"
-#    },
-
-# How to report?    
-    "heat_index": {
-        "vargem": "HIDX",    # Hong Kong Heat Index
-        "VNUM": "1",         # column 2 = mean; col 1 = max
-        "long_name": "Daily Mean Hong Kong Heat Index",
-        "incoming_unit": "degC",
-        "final_unit": "degC",
-        "context": "mean",
-        "statistic": "24h"
-    },
-    "dew_point_temp": {
-        "vargem": "DWPF",    # Dew Point TemPerature
+    "wind_speed": {
+        "vargem": "SKNT",
         "VNUM": "1",
-        "long_name": "Daily Mean Dew Point Temperature",
-        "incoming_unit": "degC",
-        "final_unit": "degC",
+        "long_name": "Wind Speed (10-minute average)",
+        "incoming_unit": "km/h",
+        "final_unit": "m/s",
         "context": "mean",
-        "statistic": "24h"
+        "statistic": "10min"
     },
-    "wet_bulb_temp": {
-        "vargem": "TWBF",    # Wet Bulb TemPerature
+    "wind_direction": {
+        "vargem": "DRCT",
         "VNUM": "1",
-        "long_name": "Daily Mean Wet Bulb Temperature",
-        "incoming_unit": "degC",
-        "final_unit": "degC",
+        "long_name": "Wind Direction (10-minute average)",
+        "incoming_unit": "degrees",
+        "final_unit": "degrees",
         "context": "mean",
-        "statistic": "24h"
+        "statistic": "10min"
     },
-    "mean_pressure": {
-        "vargem": "PRES",    # Mean Sea Level Pressure
+    "wind_gust": {
+        "vargem": "GUST",
         "VNUM": "1",
-        "long_name": "Daily Mean Pressure",
-        "incoming_unit": "hPa", # not sure
+        "long_name": "Maximum Wind Gust (10-minute)",
+        "incoming_unit": "km/h",
+        "final_unit": "m/s",
+        "context": "max",
+        "statistic": "10min"
+    },
+    "sea_level_pressure": {
+        "vargem": "PMSL",
+        "VNUM": "1",
+        "long_name": "Sea Level Pressure (1-minute)",
+        "incoming_unit": "hPa",
         "final_unit": "Pa",
         "context": "mean",
-        "statistic": "24h"
-    },
-    "total_evaporation": {
-        "vargem": "EVAP",    # EVAPoration
-        "VNUM": "1",
-        "long_name": "Daily Total Evaporation",
-        "incoming_unit": "mm",
-        "final_unit": "mm",
-        "context": "mean",
-        "statistic": "24h"
+        "statistic": "1min"
     },
     "solar_radiation": {
-        "vargem": "SOLR",    # Global Solar RaDiation
+        "vargem": "SOLR",
         "VNUM": "1",
-        "long_name": "Daily Global Solar Radiation",
-        "incoming_unit": "mjpm2", # not sure
-        "final_unit": "wpm2",
+        "long_name": "Global Solar Radiation (1-minute)",
+        "incoming_unit": "W/m^2",
+        "final_unit": "W/m^2",
         "context": "mean",
-        "statistic": "24h"
+        "statistic": "1min"
     },
-#    "uv_index": {
-#        "vargem": "UVID",    # UV Index Daily
-#        "VNUM": "1",         # column 1 = mean; col 2 = max
-#        "long_name": "Daily Mean UV Index",
-#        "incoming_unit": "dimensionless",
-#        "final_unit": "Index", 
-#        "context": "mean", Index units (unitless)
-#        "statistic": "24h"
-#    },
-    "sunshine_hours": {
-        "vargem": "MSUN",    # SunShine HouRs
+    "visibility": {
+        "vargem": "VSBY",
         "VNUM": "1",
-        "long_name": "Daily Total Bright Sunshine",
-        "incoming_unit": "hours",
-        "final_unit": "min",
+        "long_name": "Visibility (10-minute)",
+        "incoming_unit": "km",
+        "final_unit": "km",
+        "context": "mean",
+        "statistic": "10min"
+    },
+    "precip_accum_one_hour": {
+        "vargem": "P01I",
+        "VNUM": "1",
+        "long_name": "Precipitation Accumulation (1 hour)",
+        "incoming_unit": "mm",
+        "final_unit": "mm",
+        "context": "sum",
+        "statistic": "1h"
+    },
+    "precip_accum": {
+        "vargem": "PREC",
+        "VNUM": "1",
+        "long_name": "Accumulated Precipitation",
+        "incoming_unit": "mm",
+        "final_unit": "mm",
         "context": "sum",
         "statistic": "24h"
     },
-    "wind_direction": {
-        "vargem": "DRCT",    # Wind DIRection (prevailing)
+    "lightning_strike_count": {
+        "vargem": "LTGS",
         "VNUM": "1",
-        "long_name": "Daily Prevailing Wind Direction",
-        "incoming_unit": "degrees",
-        "final_unit": "degrees"
+        "long_name": "Lightning Strike Count (Hourly)",
+        "incoming_unit": "count",
+        "final_unit": "count",
+        "context": "sum",
+        "statistic": "hour"
     },
-    "mean_wind_speed": {
-        "vargem": "SKNT",    # Wind SPeeD
+    "uv_index": {
+        "vargem": "UVID",
         "VNUM": "1",
-        "long_name": "Daily Mean Wind Speed",
-        "incoming_unit": "km/h", # not sure
-        "final_unit": "m/s",
+        "long_name": "Daily UV Index",
+        "incoming_unit": "index",
+        "final_unit": "index",
         "context": "mean",
         "statistic": "24h"
     },
+    "gamma_radiation": {
+        "vargem": "GRAD",
+        "VNUM": "1",
+        "long_name": "Hourly Gamma Radiation",
+        "incoming_unit": "μSv/h",
+        "final_unit": "μSv/h",
+        "context": "mean",
+        "statistic": "hour"
+    },
+    "weather_cond_code": {
+        "vargem": "WNUM",
+        "VNUM": "1",
+        "long_name": "Weather Condition Code",
+        "incoming_unit": "code",
+        "final_unit": "code",
+        "context": "categorical",
+        "statistic": "24h"
+    }
 }

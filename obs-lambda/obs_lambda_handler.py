@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone, timedelta
-from ingestlib import poe, parse, aws, validator, metamgr,  core
+from ingestlib import poe, parse, aws, validator, metamgr, core
 from data_dictionary import variables
 import os
 import time
@@ -16,34 +16,25 @@ INGEST_NAME = 'hongkong'
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
  
 # HKO API base URL and endpoints for each variable dataset.
-# Each key is a human-readable label; value is the full API URL.
-# All endpoints return JSON. Update URLs as needed.
-# Ref: https://data.gov.hk/en-data/dataset/hk-hko-rss-*
 _BASE = "https://data.weather.gov.hk/weatherAPI/cis/csvfile"
-_WIND = "https://data.weather.gov.hk/weatherAPI/cis/csvfile"
  
 HKO_API_ENDPOINTS = {
-    # HKO station — confirmed working
     "grass_min_temp":    f"{_BASE}/HKO/ALL/daily_HKO_GMT_ALL.csv",
     "mean_cloud":        f"{_BASE}/HKO/ALL/daily_HKO_CLD_ALL.csv",
     "total_rainfall":    f"{_BASE}/HKO/ALL/daily_HKO_RF_ALL.csv",
     "mean_humidity":     f"{_BASE}/HKO/ALL/daily_HKO_RH_ALL.csv",
-    "max_mean_min_temp": f"{_BASE}/HKO/ALL/daily_HKO_TEMP_ALL.csv",
+    "air_temp":          f"{_BASE}/HKO/ALL/daily_HKO_TEMP_ALL.csv",
     "dew_point_temp":    f"{_BASE}/HKO/ALL/daily_HKO_DEW_ALL.csv",
     "wet_bulb_temp":     f"{_BASE}/HKO/ALL/daily_HKO_WET_ALL.csv",
     "mean_pressure":     f"{_BASE}/HKO/ALL/daily_HKO_MSLP_ALL.csv",
-    # KP station
     "heat_index":        f"{_BASE}/KP/ALL/daily_KP_MEANHKHI_ALL.csv",
     "total_evaporation": f"{_BASE}/KP/ALL/daily_KP_EVAP_ALL.csv",
     "solar_radiation":   f"{_BASE}/KP/ALL/daily_KP_GSR_ALL.csv",
     "uv_index":          f"{_BASE}/KP/ALL/daily_KP_UV_ALL.csv",
     "sunshine_hours":    f"{_BASE}/KP/ALL/daily_KP_SUN_ALL.csv",
     "mean_wind_speed":   f"{_BASE}/KP/ALL/daily_KP_WSPD_ALL.csv",
-    "wind_direction":    f"{_BASE}/KP/ALL/daily_KP_WDIR_ALL.csv",
-    # WGL station
     "mean_sea_temp":     f"{_BASE}/WGL/ALL/daily_WGL_SST_ALL.csv",
-    # HKA station
-    "visibility_hours":  f"{_BASE}/HKA/ALL/daily_HKA_RVIS_ALL.csv",
+    "visibility":        f"{_BASE}/HKA/ALL/daily_HKA_RVIS_ALL.csv",
 }
  
 LABEL_TO_STATION = {
@@ -51,12 +42,10 @@ LABEL_TO_STATION = {
     for label, url in HKO_API_ENDPOINTS.items()
 }
 
+PREVIOUS_HOURS_TO_RETAIN = 12  # hours to retain
 
 def load_seen_obs(filepath):
-    """Load already-processed observation keys from seen_obs.txt.
-    Keys are station|dattim — one per line.
-    Returns empty set on first run (file empty or missing).
-    """
+    """Load already-processed observation keys from seen_obs.txt."""
     if os.path.exists(filepath):
         with open(filepath, 'r') as f:
             return set(line.strip() for line in f if line.strip())
@@ -74,16 +63,7 @@ def save_seen_obs(filepath, seen_set):
 # FETCH
 ########################################################################################################################
 def fetch_hko_data():
-    """
-    Fetch data from all HKO API endpoints defined in HKO_API_ENDPOINTS.
- 
-    Mirrors the meteoswiss fetch pattern: iterate over known endpoints,
-    request each one, and return a dict keyed by variable label.
- 
-    Returns:
-        dict: { variable_label: raw_text_content } for successful fetches,
-              or None if all requests fail.
-    """
+    """Fetch data from all HKO API endpoints."""
     incoming_data = {}
  
     for label, url in HKO_API_ENDPOINTS.items():
@@ -109,14 +89,9 @@ def fetch_hko_data():
 # DEFINE ETL/PARSING FUNCTIONS
 ########################################################################################################################
 def _csv_to_structured(label: str, raw_csv: str) -> dict:
-    """
-    Convert a raw HKO CSV string into a structured dict matching the
-    Singapore-style cache format, so the cached JSON contains parsed
-    records rather than raw CSV text.
-    """
+    """Convert raw CSV to structured dict."""
     import csv
     from io import StringIO
- 
     lines = raw_csv.splitlines()
  
     # Extract comment/metadata lines that appear before the Year/Month/Day header
@@ -142,12 +117,9 @@ def _csv_to_structured(label: str, raw_csv: str) -> dict:
         },
     }
  
- 
+
 def cache_raw_data_simple(incoming_data, work_dir: str, s3_bucket_name: str, s3_prefix: str):
-    """
-    Save raw incoming data dict to a timestamped JSON file and upload to S3.
-    Each run creates a unique file — no diffing or merging.
-    """
+    """Cache raw data to S3."""
     try:
         if not incoming_data:
             logger.debug("CACHE: no incoming data; skipping")
@@ -198,6 +170,7 @@ def cache_raw_data_simple(incoming_data, work_dir: str, s3_bucket_name: str, s3_
 # PARSE
 ########################################################################################################################
 def parse_hko_data(incoming_data, station_meta):
+    """Parse the raw CSV data into a dict of station|dattim: data."""
     import csv
     from io import StringIO
  
@@ -208,7 +181,11 @@ def parse_hko_data(incoming_data, station_meta):
             continue
  
         station_id = LABEL_TO_STATION.get(label, "")
-        synoptic_stid = station_meta.get(station_id, {}).get("SYNOPTIC_STID", station_id)
+        if not station_id:
+            logger.warning(f"PARSE: Unknown station label {label}, skipping")
+            continue
+        STID_PREFIX = "HKI"
+        synoptic_stid = f"{STID_PREFIX}{station_id}"
  
         # Key in data_dictionary IS the endpoint label — direct lookup
         var_config = variables.get(label)
@@ -287,7 +264,7 @@ def main(event, context):
         work_dir = "/tmp/tmp/"
         s3_work_dir = "tmp/"
  
-    # --- logging (stdout + single file; overwrites each run) ---
+    # --- logging ---
     log_file = core.setup_logging(
         logger, INGEST_NAME,
         log_level=getattr(args, "log_level", "INFO"),
@@ -315,9 +292,12 @@ def main(event, context):
  
         s3_meta_work_dir = "metadata"
         s3_station_meta_file = posixpath.join(s3_meta_work_dir, f"{INGEST_NAME}_stations_metadata.json")
-        s3_seen_obs_file     = posixpath.join(s3_work_dir, "seen_obs.txt")
-        seen_obs_file        = os.path.join(work_dir, "seen_obs.txt")
-        station_meta_file    = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
+        s3_seen_obs_file   = posixpath.join(s3_work_dir, "seen_obs.txt")
+        seen_obs_file      = os.path.join(work_dir, "seen_obs.txt")
+        station_meta_file  = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
+        grouped_obs_file   = os.path.join(work_dir, "grouped_obs.txt")
+        # Determine the time before which data will not be archived
+        data_archive_time = datetime.now(timezone.utc) - timedelta(hours=PREVIOUS_HOURS_TO_RETAIN)
  
         # Download seen observations file
         try:
@@ -346,9 +326,7 @@ def main(event, context):
         incoming_data = fetch_hko_data()
         logger.debug(f"FETCH: got data? {bool(incoming_data)}")
  
-        # Convert raw CSV strings to structured dicts before caching, so the
-        # cached JSON matches the Singapore-style format (parsed records, not raw text).
-        # parse_hko_data still receives the original raw CSV strings for parsing.
+        # Convert raw CSV strings to structured dicts
         cache_data = None
         if incoming_data:
             cache_data = {
@@ -356,7 +334,7 @@ def main(event, context):
                 for label, raw_csv in incoming_data.items()
             }
  
-        # store raw incoming data in the data provider raw cache bucket
+        # Store raw incoming data in cache
         cache_raw_data_simple(
             incoming_data=cache_data,
             work_dir=work_dir,
@@ -367,11 +345,12 @@ def main(event, context):
         if incoming_data:
             logger.info(msg=json.dumps({'Incoming_Data_Success': 1}))
 
-            # Parse all fetched CSVs into a unified grouped observations dict.
-            # Keys from parse_hko_data are station|dattim.
+            # Parse incoming data into a grouped dict (station|dattim)
             grouped_obs_set = parse_hko_data(incoming_data, station_meta)
 
-            # Build obs strings: "station|dattim|{json_blob}"
+            if not grouped_obs_set:
+                logger.warning("PARSE: No grouped observations generated, skipping validation and POE")
+                return
             grouped_obs = [
                 f"{k}|{json.dumps(v).replace(' ', '')}"
                 for k, v in grouped_obs_set.items()
@@ -421,11 +400,7 @@ def main(event, context):
             if variables_table:
                 variable_validators.append(partial(validator.validate_variables, variables_table=variables_table))
                 variable_validators[-1].__name__ = "validate_variables"
- 
-            # Define the valid dattim window for observation validation.
-            # HKO serves historical daily data, so we accept everything from
-            # a generous past horizon up to the current moment.
-            LOOKBACK_DAYS = 365 * 200   # ~200 years covers the full HKO archive
+            LOOKBACK_DAYS = 12
             end_time   = datetime.now(timezone.utc)
             start_time = end_time - timedelta(days=LOOKBACK_DAYS)
  
