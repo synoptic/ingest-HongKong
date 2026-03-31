@@ -14,127 +14,78 @@ variables = {
     "air_temp": {
         "vargem": "TMPF",
         "VNUM": "1",
-        "long_name": "Air Temperature (1-minute)",
+        "long_name": "The latest 1-minute mean air temperature",
         "incoming_unit": "degC",
         "final_unit": "degC",
         "context": "mean",
-        "statistic": "1min"
+        "statistic": "1 min"
     },
-    "relative_humidity": {
+    "mean_humidity": {
         "vargem": "RELH",
         "VNUM": "1",
-        "long_name": "Relative Humidity (1-minute)",
+        "long_name": "The latest 1-minute mean relative humidity",
         "incoming_unit": "pct",
         "final_unit": "pct",
         "context": "mean",
-        "statistic": "1min"
-    },
+        "statistic": "1 min"
+    },    
     "wind_speed": {
         "vargem": "SKNT",
         "VNUM": "1",
-        "long_name": "Wind Speed (10-minute average)",
+        "long_name": "The latest 10-minute mean wind direction and wind speed and maximum gust",
         "incoming_unit": "km/h",
         "final_unit": "m/s",
         "context": "mean",
-        "statistic": "10min"
+        "statistic": "10 min"
     },
-    "wind_direction": {
-        "vargem": "DRCT",
-        "VNUM": "1",
-        "long_name": "Wind Direction (10-minute average)",
-        "incoming_unit": "degrees",
-        "final_unit": "degrees",
-        "context": "mean",
-        "statistic": "10min"
-    },
-    "wind_gust": {
+    "wind_gust":{
         "vargem": "GUST",
         "VNUM": "1",
-        "long_name": "Maximum Wind Gust (10-minute)",
+        "long_name": "The latest 10-minute maximum wind gust",
         "incoming_unit": "km/h",
         "final_unit": "m/s",
         "context": "max",
-        "statistic": "10min"
+        "statistic": "10 min"
     },
-    "sea_level_pressure": {
+    "mean_pressure": {
         "vargem": "PMSL",
         "VNUM": "1",
-        "long_name": "Sea Level Pressure (1-minute)",
+        "long_name": "The latest 1-minute mean sea level pressure",
         "incoming_unit": "hPa",
         "final_unit": "Pa",
         "context": "mean",
-        "statistic": "1min"
+        "statistic": "1 min"
     },
     "solar_radiation": {
         "vargem": "SOLR",
         "VNUM": "1",
-        "long_name": "Global Solar Radiation (1-minute)",
-        "incoming_unit": "W/m^2",
-        "final_unit": "W/m^2",
+        "long_name": "Global Solar Radiation (Daily)",
+        "incoming_unit": "W/m²",
+        "final_unit": "W/m²"
+    },
+    "diffuse_radiation": {
+        "vargem": "DIFR",
+        "VNUM": "1",
+        "long_name": "Diffuse Radiation (Daily)",
+        "incoming_unit": "W/m²",
+        "final_unit": "W/m²"
+    },  
+    "grass_min_temp": {
+        "vargem": "TMPG",
+        "VNUM": "1",
+        "long_name": "the latest 1-minute mean grass temperature from 5:00 p.m. to 8:00 a.m. the following date Hong Kong time",
+        "incoming_unit": "degC",
+        "final_unit": "degC",
         "context": "mean",
-        "statistic": "1min"
+        "statistic": "1 min"
     },
     "visibility": {
         "vargem": "VSBY",
         "VNUM": "1",
-        "long_name": "Visibility (10-minute)",
+        "long_name": "the latest 10-minute mean visibility",
         "incoming_unit": "km",
-        "final_unit": "km",
+        "final_unit": "statutemile",
         "context": "mean",
-        "statistic": "10min"
+        "statistic": "10 min"
     },
-    "precip_accum_one_hour": {
-        "vargem": "P01I",
-        "VNUM": "1",
-        "long_name": "Precipitation Accumulation (1 hour)",
-        "incoming_unit": "mm",
-        "final_unit": "mm",
-        "context": "sum",
-        "statistic": "1h"
-    },
-    "precip_accum": {
-        "vargem": "PREC",
-        "VNUM": "1",
-        "long_name": "Accumulated Precipitation",
-        "incoming_unit": "mm",
-        "final_unit": "mm",
-        "context": "sum",
-        "statistic": "24h"
-    },
-    "lightning_strike_count": {
-        "vargem": "LTGS",
-        "VNUM": "1",
-        "long_name": "Lightning Strike Count (Hourly)",
-        "incoming_unit": "count",
-        "final_unit": "count",
-        "context": "sum",
-        "statistic": "hour"
-    },
-    "uv_index": {
-        "vargem": "UVID",
-        "VNUM": "1",
-        "long_name": "Daily UV Index",
-        "incoming_unit": "index",
-        "final_unit": "index",
-        "context": "mean",
-        "statistic": "24h"
-    },
-    "gamma_radiation": {
-        "vargem": "GRAD",
-        "VNUM": "1",
-        "long_name": "Hourly Gamma Radiation",
-        "incoming_unit": "μSv/h",
-        "final_unit": "μSv/h",
-        "context": "mean",
-        "statistic": "hour"
-    },
-    "weather_cond_code": {
-        "vargem": "WNUM",
-        "VNUM": "1",
-        "long_name": "Weather Condition Code",
-        "incoming_unit": "code",
-        "final_unit": "code",
-        "context": "categorical",
-        "statistic": "24h"
-    }
 }

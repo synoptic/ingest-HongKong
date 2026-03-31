@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from ingestlib import poe, parse, aws, validator, metamgr, core
 from data_dictionary import variables
 import os
@@ -15,34 +16,53 @@ from functools import partial
 INGEST_NAME = 'hongkong'
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
  
-# HKO API base URL and endpoints for each variable dataset.
-_BASE = "https://data.weather.gov.hk/weatherAPI/cis/csvfile"
- 
 HKO_API_ENDPOINTS = {
-    "grass_min_temp":    f"{_BASE}/HKO/ALL/daily_HKO_GMT_ALL.csv",
-    "mean_cloud":        f"{_BASE}/HKO/ALL/daily_HKO_CLD_ALL.csv",
-    "total_rainfall":    f"{_BASE}/HKO/ALL/daily_HKO_RF_ALL.csv",
-    "mean_humidity":     f"{_BASE}/HKO/ALL/daily_HKO_RH_ALL.csv",
-    "air_temp":          f"{_BASE}/HKO/ALL/daily_HKO_TEMP_ALL.csv",
-    "dew_point_temp":    f"{_BASE}/HKO/ALL/daily_HKO_DEW_ALL.csv",
-    "wet_bulb_temp":     f"{_BASE}/HKO/ALL/daily_HKO_WET_ALL.csv",
-    "mean_pressure":     f"{_BASE}/HKO/ALL/daily_HKO_MSLP_ALL.csv",
-    "heat_index":        f"{_BASE}/KP/ALL/daily_KP_MEANHKHI_ALL.csv",
-    "total_evaporation": f"{_BASE}/KP/ALL/daily_KP_EVAP_ALL.csv",
-    "solar_radiation":   f"{_BASE}/KP/ALL/daily_KP_GSR_ALL.csv",
-    "uv_index":          f"{_BASE}/KP/ALL/daily_KP_UV_ALL.csv",
-    "sunshine_hours":    f"{_BASE}/KP/ALL/daily_KP_SUN_ALL.csv",
-    "mean_wind_speed":   f"{_BASE}/KP/ALL/daily_KP_WSPD_ALL.csv",
-    "mean_sea_temp":     f"{_BASE}/WGL/ALL/daily_WGL_SST_ALL.csv",
-    "visibility":        f"{_BASE}/HKA/ALL/daily_HKA_RVIS_ALL.csv",
-}
- 
-LABEL_TO_STATION = {
-    label: url.split('/')[-3]
-    for label, url in HKO_API_ENDPOINTS.items()
+    "air_temp":               "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_temperature.csv",
+    "mean_humidity":          "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_humidity.csv",
+    "wind_speed":             "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_10min_wind.csv",
+    "wind_gust":              "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_10min_wind.csv",
+    "mean_pressure":          "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_pressure.csv",
+    "solar_radiation":        "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_solar.csv",
+    "diffuse_radiation":      "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_solar.csv",
+    "grass_min_temp":         "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_grass.csv",
+    "visibility":             "https://data.weather.gov.hk/weatherAPI/opendata/opendata.php?dataType=LTMV&lang=en&rformat=csv",
 }
 
 PREVIOUS_HOURS_TO_RETAIN = 12  # hours to retain
+
+# ---------------------------------------------------------------------------
+# Column name mappings
+# Each label maps to the exact column header(s) that carry its value(s).
+# For wind the CSV has both speed and gust in one file; we key by label so
+# each label picks the right column.
+# ---------------------------------------------------------------------------
+LABEL_VALUE_COLUMN = {
+    "air_temp":          "Air Temperature(degree Celsius)",
+    "mean_humidity":     "Relative Humidity(percent)",
+    "wind_speed":        "10-Minute Mean Speed(km/hour)",
+    "wind_gust":         "10-Minute Maximum Gust(km/hour)",
+    "mean_pressure":     "Mean Sea Level Pressure(hPa)",
+    "solar_radiation":   "Global Solar Radiation(watt/square meter)",
+    "diffuse_radiation": "Diffuse Radiation(watt/square meter)",
+    "grass_min_temp":    "Grass Temperature(degree Celsius)",
+    "visibility":        "10 minute mean visibility",
+}
+
+# HKO date-time column header
+DATETIME_COL = "Date time"
+STATION_COL  = "Automatic Weather Station"
+
+
+def _station_name_to_stid(station_name: str) -> str:
+    """
+    Convert a human-readable HKO station name to a compact alphanumeric ID.
+    Removes non-alphanumeric characters and uppercases the result, then
+    prepends the network prefix "HKI".
+    """
+    import re
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", station_name).upper()
+    return f"HKI{cleaned}"
+
 
 def load_seen_obs(filepath):
     """Load already-processed observation keys from seen_obs.txt."""
@@ -169,71 +189,160 @@ def cache_raw_data_simple(incoming_data, work_dir: str, s3_bucket_name: str, s3_
 ########################################################################################################################
 # PARSE
 ########################################################################################################################
+def _parse_hko_datetime(raw: str) -> Optional[datetime]:
+    """
+    Parse HKO compact datetime string: YYYYMMDDHHmm (12 digits, HKT = UTC+8).
+    Returns a UTC datetime or None on failure.
+    """
+    raw = raw.strip()
+    if len(raw) != 12 or not raw.isdigit():
+        return None
+    try:
+        # HKO timestamps are in Hong Kong Time (UTC+8)
+        hkt = timezone(timedelta(hours=8))
+        dt_hkt = datetime(
+            int(raw[0:4]), int(raw[4:6]), int(raw[6:8]),
+            int(raw[8:10]), int(raw[10:12]),
+            tzinfo=hkt
+        )
+        return dt_hkt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_value(label: str, raw_val: str) -> Optional[float]:
+    """
+    Extract a numeric value from a raw string and apply unit conversions
+    using ingestlib (parse.get_translated_value / parse.create_conversion /
+    parse.convert_units), driven entirely by the variables data dictionary.
+
+    Returns the converted float, or None if the value is missing / non-numeric.
+    """
+    # Strip surrounding whitespace and quotes
+    raw_val = raw_val.strip().strip('"')
+
+    # Visibility comes as "17 km" — extract the numeric part only
+    if label == "visibility":
+        raw_val = raw_val.lower().replace("km", "").strip()
+
+    if not raw_val or raw_val.upper() in ("N/A", "NA", ""):
+        return None
+
+    try:
+        value = float(raw_val)
+    except ValueError:
+        return None
+
+    # Resolve units from the variables dict
+    incoming_unit = parse.get_translated_value(label, variables=variables, field='incoming_unit')
+    final_unit    = variables[label]['final_unit']
+
+    # Apply conversion only when the units differ
+    if incoming_unit and incoming_unit != final_unit:
+        try:
+            conversion_name = parse.create_conversion(incoming_unit, variables, label)
+            value = round(parse.convert_units(conversion_name, value), 3)
+        except Exception:
+            # Fall back to unconverted value if ingestlib can't resolve the conversion
+            value = round(value, 3)
+    else:
+        value = round(value, 3)
+
+    return value
+
+
 def parse_hko_data(incoming_data, station_meta):
-    """Parse the raw CSV data into a dict of station|dattim: data."""
+    """
+    Parse the raw CSV data into a dict keyed by  station|dattim.
+
+    HKO CSVs have this actual format (no Year/Month/Day columns):
+        Date time,Automatic Weather Station,<value column(s)>
+        202603311600,King's Park,27.0
+    """
     import csv
     from io import StringIO
  
     grouped_obs_set = {}
- 
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=PREVIOUS_HOURS_TO_RETAIN)
+    skipped_old   = 0
+    #skipped_noval ensures only valid numeric observations go forward.
+    skipped_noval = 0
+
     for label, raw_csv in incoming_data.items():
         if not raw_csv:
             continue
- 
-        station_id = LABEL_TO_STATION.get(label, "")
-        if not station_id:
-            logger.warning(f"PARSE: Unknown station label {label}, skipping")
-            continue
-        STID_PREFIX = "HKI"
-        synoptic_stid = f"{STID_PREFIX}{station_id}"
- 
-        # Key in data_dictionary IS the endpoint label — direct lookup
+
         var_config = variables.get(label)
         if not var_config:
             logger.warning(f"PARSE: No variable mapping for label '{label}', skipping")
             continue
- 
-        vargem = var_config["vargem"]
-        vnum   = var_config["VNUM"]
- 
-        try:
-            lines = raw_csv.splitlines()
-            header_idx = next((i for i, l in enumerate(lines) if "Year" in l), None)
-            if header_idx is None:
-                logger.warning(f"PARSE: Could not find header row for {label}, skipping")
-                continue
- 
-            reader = csv.DictReader(StringIO('\n'.join(lines[header_idx:])))
- 
-            for row in reader:
-                try:
-                    year  = next((row[k].strip() for k in row if "Year"  in k), "")
-                    month = next((row[k].strip() for k in row if "Month" in k), "")
-                    day   = next((row[k].strip() for k in row if "Day"   in k), "")
- 
-                    if not (year and month and day):
-                        continue
- 
-                    dt_utc = datetime(int(year), int(month), int(day), tzinfo=timezone.utc)
-                    dattim_str = dt_utc.strftime("%Y%m%d%H%M")
- 
-                except (ValueError, AttributeError):
-                    continue
- 
-                raw_val = next((row[k].strip() for k in row if "Value" in k), "")
-                if not raw_val:
-                    continue
- 
-                try:
-                    value = round(float(raw_val), 3)
-                except ValueError:
-                    continue
- 
-                if vargem in ["PMSL", "PRES"]:
-                    value = value * 100
 
-                # Key is station|dattim — multiple variables for the same
-                # station+timestamp are merged into a single obs record.
+        vargem = parse.get_translated_value(label, variables=variables, field='vargem')
+        if not vargem:
+            logger.warning(f"PARSE: Could not resolve vargem for label '{label}', skipping")
+            continue
+        vnum = int(variables[label]['VNUM'])
+
+        # Identify which CSV column holds this label's value
+        value_col = LABEL_VALUE_COLUMN.get(label)
+        if not value_col:
+            logger.warning(f"PARSE: No value-column mapping for label '{label}', skipping")
+            continue
+
+        try:
+            # Strip UTF-8 BOM if present
+            clean_csv = raw_csv.lstrip('\ufeff')
+            lines = clean_csv.splitlines()
+            if not lines:
+                logger.warning(f"PARSE: Empty CSV for {label}, skipping")
+                continue
+
+            # Strip quotes from header line (visibility CSV wraps headers in quotes)
+            lines[0] = ','.join(h.strip().strip('"') for h in lines[0].split(','))
+
+            reader = csv.DictReader(StringIO('\n'.join(lines)))
+
+            # Validate that the expected columns exist
+            fieldnames = reader.fieldnames or []
+            missing = [c for c in (DATETIME_COL, STATION_COL, value_col) if c not in fieldnames]
+            if missing:
+                logger.warning(
+                    f"PARSE: CSV for '{label}' is missing expected columns {missing}. "
+                    f"Found: {fieldnames}. Skipping."
+                )
+                continue
+
+            rows_list = list(reader)
+            logger.debug(f"PARSE [{label}]: {len(rows_list)} rows, value_col='{value_col}'")
+
+            for row in rows_list:
+                # --- datetime ---
+                raw_dt = row.get(DATETIME_COL, "").strip()
+                dt_utc = _parse_hko_datetime(raw_dt)
+                if dt_utc is None:
+                    logger.debug(f"PARSE [{label}]: unparseable datetime '{raw_dt}', skipping row")
+                    continue
+
+                if dt_utc < cutoff_dt:
+                    skipped_old += 1
+                    continue
+
+                dattim_str = dt_utc.strftime("%Y%m%d%H%M")
+
+                # --- station ID ---
+                station_name = row.get(STATION_COL, "").strip()
+                if not station_name:
+                    continue
+                synoptic_stid = _station_name_to_stid(station_name)
+
+                # --- value ---
+                raw_val = row.get(value_col, "")
+                value = _parse_value(label, raw_val)
+                if value is None:
+                    skipped_noval += 1
+                    continue
+
+                # --- merge into grouped_obs_set ---
                 key = f"{synoptic_stid}|{dattim_str}"
                 if key in grouped_obs_set:
                     grouped_obs_set[key][vargem] = {vnum: value}
@@ -243,7 +352,15 @@ def parse_hko_data(incoming_data, station_meta):
         except Exception as e:
             logger.warning(f"PARSE: Failed to parse {label}: {e}")
             continue
- 
+
+    if skipped_old:
+        logger.debug(
+            f"PARSE: Skipped {skipped_old} rows older than "
+            f"{cutoff_dt.strftime('%Y-%m-%dT%H:%MZ')}"
+        )
+    if skipped_noval:
+        logger.debug(f"PARSE: Skipped {skipped_noval} rows with missing/non-numeric values")
+
     logger.debug(f"PARSE: Created {len(grouped_obs_set)} grouped observations")
     return grouped_obs_set
  
@@ -400,9 +517,8 @@ def main(event, context):
             if variables_table:
                 variable_validators.append(partial(validator.validate_variables, variables_table=variables_table))
                 variable_validators[-1].__name__ = "validate_variables"
-            LOOKBACK_DAYS = 12
             end_time   = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=LOOKBACK_DAYS)
+            start_time = end_time - timedelta(hours=24)
  
             # Observation validations
             obs_validators = [
