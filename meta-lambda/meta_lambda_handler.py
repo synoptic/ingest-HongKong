@@ -22,14 +22,15 @@ from bs4 import BeautifulSoup
 # OVERVIEW
 ########################################################################################################################
 # Hong Kong station metadata ingest.
-# - The station metadata JSON ALREADY EXISTS in S3. We MUST download it every run.
-# - We MUST NOT default existing_stations to {} (that masks load failures and causes overwrites).
-# - We merge fetched stations INTO the existing station_meta:
-#     - Never overwrite SYNOPTIC_STID once set.
-#     - Update mutable fields (NAME/LAT/LON/OTID/ELEVATION).
-#     - Never delete stations just because they didn't appear in today's scrape.
-# - Then generate station_lookup payload and run station_lookup.load_metamgr.
-# - Persist merged station_meta back to S3 and upload generated SQL files.
+#   1. The station metadata JSON MUST be downloaded from S3 at the start of every run.
+#      Defaulting existing_stations to {} would mask S3 load failures and risk
+#      overwriting live station records — this is never permitted.
+#   2. Fetched stations are merged INTO existing_stations:
+#        - SYNOPTIC_STID is immutable once assigned.
+#        - Mutable fields (NAME / LAT / LON / OTID / ELEVATION) are updated from scrape.
+#        - Stations absent from today's scrape are KEPT (not silently deleted).
+#   3. station_lookup.load_metamgr is called with the merged payload.
+#   4. The merged station_meta is persisted back to S3 along with generated SQL files.
 ########################################################################################################################
 
 ########################################################################################################################
@@ -46,25 +47,89 @@ STID_PREFIX = "HKI" #TODO add the stid prefix
 
 HKO_STATION_URL = "https://www.hko.gov.hk/en/cis/stn.htm"
 
+# HTTP retry config for metadata scrape
+_META_MAX_RETRIES   = 3
+_META_BACKOFF       = 2.0   # seconds; wait = backoff * attempt
+
 ########################################################################################################################
 # DEFINE LOGS
 ########################################################################################################################
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
-# Assume core.setup_logging is available
-# from ingestlib import core
 
-# --------- Helper: Fetch HKO station metadata dynamically ---------
-def fetch_hko_station_metadata_raw():
-    out = {}
 
-    url = "https://www.hko.gov.hk/en/cis/stn.htm"
+########################################################################################################################
+# FETCH STATION METADATA
+########################################################################################################################
 
+def _dms_to_decimal(dms_str: str):
+    """
+    Convert a DMS (degrees / minutes / seconds) coordinate string to decimal degrees.
+
+    Handles formats such as:
+        22°18'07"N    22°18'N    22°18.1'N
+    Returns a rounded float or None if the string cannot be parsed.
+    """
     try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[HKO FETCH] Failed to fetch {url}: {e}")
-        return out
+        dms_str = dms_str.strip()
+        match = re.match(
+            r"(\d+)[°d]\s*(\d+(?:\.\d+)?)?['′]?\s*(\d+(?:\.\d+)?)?[\"″]?\s*([NSEW])?",
+            dms_str
+        )
+        if not match:
+            return None
+
+        degrees   = float(match.group(1))
+        minutes   = float(match.group(2)) if match.group(2) else 0.0
+        seconds   = float(match.group(3)) if match.group(3) else 0.0
+        direction = match.group(4)
+
+        decimal = degrees + minutes / 60.0 + seconds / 3600.0
+        if direction in ('S', 'W'):
+            decimal *= -1
+
+        return round(decimal, 6)
+    except Exception:
+        return None
+
+
+def fetch_hko_station_metadata_raw() -> dict:
+    """
+    Scrape the HKO station list page and return a dict keyed by station code.
+
+    Retries up to _META_MAX_RETRIES times with exponential back-off.
+
+    Each entry has the shape::
+
+        {
+            "NAME":      str,
+            "LAT":       float,
+            "LON":       float,
+            "OTID":      str,   # == station code
+            "ELEVATION": float | None,
+        }
+
+    Stations with unparseable coordinates are skipped and counted so the
+    operator can see how many were lost.
+    """
+    out: dict = {}
+    skipped = 0
+
+    for attempt in range(1, _META_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(HKO_STATION_URL, timeout=30)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            wait = _META_BACKOFF * attempt
+            logger.warning(
+                f"META FETCH: attempt {attempt}/{_META_MAX_RETRIES} failed — {e}; "
+                f"retrying in {wait:.1f}s"
+            )
+            if attempt < _META_MAX_RETRIES:
+                time.sleep(wait)
+            else:
+                logger.error(f"META FETCH: all attempts exhausted for {HKO_STATION_URL}")
+                return out
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -85,12 +150,12 @@ def fetch_hko_station_metadata_raw():
             try:
                 name_cell = cols[0].get_text(strip=True)
 
-                # Extract station code inside ()
+                # Station code is inside parentheses, e.g. "King's Park (KP)"
                 match = re.search(r"\((.*?)\)", name_cell)
                 if not match:
                     continue
 
-                code = match.group(1)
+                code = match.group(1).strip()
                 name = name_cell.split("(")[0].strip()
 
                 lat_raw = cols[1].get_text(strip=True)
@@ -101,12 +166,17 @@ def fetch_hko_station_metadata_raw():
                 lon = _dms_to_decimal(lon_raw)
 
                 if lat is None or lon is None:
+                    logger.debug(
+                        f"META FETCH: skipping '{name}' ({code}) — "
+                        f"could not parse lat='{lat_raw}' lon='{lon_raw}'"
+                    )
+                    skipped += 1
                     continue
 
-                elevation = None
+                elevation: float | None = None
                 try:
                     elevation = float(elev_raw)
-                except:
+                except (ValueError, TypeError):
                     pass
 
                 out[code] = {
@@ -118,56 +188,39 @@ def fetch_hko_station_metadata_raw():
                 }
 
             except Exception as e:
-                print(f"[HKO PARSE] Skipping row due to error: {e}")
+                logger.debug(f"META FETCH: skipping row due to error: {e}")
+                skipped += 1
                 continue
 
-    print(f"[HKO FETCH] Scraped {len(out)} stations from HTML")
+    logger.info(
+        f"META FETCH: scraped {len(out)} stations "
+        f"({skipped} rows skipped due to parse errors)"
+    )
     return out
 
-def _dms_to_decimal(dms_str):
-    """Convert a DMS (degrees/minutes/seconds) coordinate string to decimal degrees."""
-    try:
-        dms_str = dms_str.strip()
-
-        match = re.match(r"(\d+)[°d]\s*(\d+)?['′]?\s*(\d+)?[\"″]?\s*([NSEW])?", dms_str)
-        if not match:
-            return None
-
-        degrees = float(match.group(1))
-        minutes = float(match.group(2)) if match.group(2) else 0.0
-        seconds = float(match.group(3)) if match.group(3) else 0.0
-        direction = match.group(4)
-
-        decimal = degrees + minutes / 60 + seconds / 3600
-
-        if direction in ['S', 'W']:
-            decimal *= -1
-
-        return round(decimal, 6)
-
-    except:
-        return None     
-# --------- Generate metadata payload (from your existing code) ---------
 
 ########################################################################################################################
 # PAYLOAD GENERATION
 ########################################################################################################################
-def generate_metadata_payload(station_meta, payload_type, source_info=None):
+def generate_metadata_payload(station_meta: dict, payload_type: str, source_info: dict = None):
     """
-    Generates the metadata payload for ingestlib station lookup
+    Generate the metadata payload for ingestlib station_lookup or metamanager.
 
     Args:
-        station_meta (dict): A dictionary containing station metadata.
-        payload_type (str): Type of payload ('station_lookup' or 'metamanager').
-        source_info (dict): Optional source information for the metamanager payload.
+        station_meta:  Merged station dict (SYNOPTIC_STID already resolved).
+        payload_type:  ``'station_lookup'`` or ``'metamanager'``.
+        source_info:   Optional override for the metamanager source block.
 
     Returns:
-        dict or str: Parsed metadata payload based on the payload type.
+        dict  for ``station_lookup`` payloads.
+        str   (JSON) for ``metamanager`` payloads.
     """
     if payload_type not in {"station_lookup", "metamanager"}:
-        raise ValueError("Invalid payload_type. Must be 'station_lookup' or 'metamanager'.")
+        raise ValueError("payload_type must be 'station_lookup' or 'metamanager'")
 
     metadata = []
+    skipped_missing  = 0
+    skipped_invalid  = 0
 
     for station_id, row in station_meta.items():
         try:
@@ -180,20 +233,29 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
             elevation = row.get('ELEVATION', None)
 
 
-            # Clean name with ascii characters, NOTE that we are NOT converting single apostrophe's to double apostrophe's
-            # station_lookup.load_metamgr does this already. Duplicating the apostrophe's is unnecessary
+            # Name sanitisation
             if name:
                 clean_name = core.ascii_sanitize(name) if not name.isascii() else name
             else:
                 clean_name = None
 
-            # Check lat/lon validity
+            # Validate required fields before attempting type conversion
+            if not stid or not clean_name:
+                logger.debug(
+                    f"PAYLOAD: skipping {station_id} — missing STID or NAME"
+                )
+                skipped_missing += 1
+                continue
+
             if lat is None or lon is None:
+                logger.debug(f"PAYLOAD: skipping {station_id} — missing LAT/LON")
+                skipped_missing += 1
                 continue
             lat = float(lat)
             lon = float(lon)
             if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
-                logger.debug(f"Skipping station {station_id} due to invalid lat/lon: {lat}, {lon}")
+                logger.debug(f"PAYLOAD: skipping {station_id} — invalid lat/lon ({lat}, {lon})")
+                skipped_invalid += 1
                 continue
 
             # Check Elevation
@@ -203,13 +265,12 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
                 if ELEVATION_UNIT == 'METERS':
                     elevation *= M_TO_FEET
                 elif ELEVATION_UNIT != 'FEET':
-                    raise ValueError("Invalid ELEVATION_UNIT, must be 'METERS' or 'FEET'")
+                    raise ValueError(f"Invalid ELEVATION_UNIT: '{ELEVATION_UNIT}'")
                 
                 if math.isnan(elevation):
                     elevation = None
 
-            if stid and name:
-                station = {
+            metadata.append({
                     "STID": stid,
                     "NAME": clean_name,
                     "LATITUDE": lat,
@@ -219,50 +280,38 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
                     "ELEVATION": None if elevation is None else round(elevation, 3),
                     "RESTRICTED_DATA": row.get('RESTRICTED_DATA', RESTRICTED_DATA_STATUS),
                     "RESTRICTED_METADATA": row.get('RESTRICTED_METADATA', RESTRICTED_METADATA_STATUS)
-                }
-                metadata.append(station)
-            else:
-                logger.debug(f"Skipping station {station_id} due to missing required fields: STID or NAME.")
-        except ValueError as e:
-            logger.debug(f"Skipping station {station_id} due to error: {e}")
+            })
+        except ValueError as exc:
+            logger.debug(f"PAYLOAD: skipping {station_id} — {exc}")
+            skipped_invalid += 1
+
+    logger.info(
+        f"PAYLOAD: built {len(metadata)} station records "
+        f"(skipped: missing={skipped_missing}, invalid={skipped_invalid})"
+    )
     
     if payload_type == "station_lookup":
-        payload = {
-            "MNET_ID": MNET_ID,
-            "STNS": metadata
-        }
-    else:
-        default_source = {
-            "name": "Administration Console",
-            "environment": str(MNET_ID)
-        }
-        payload = {
-            "source": source_info if source_info else default_source,
-            "metadata": metadata
-        }
-    
-    return json.dumps(payload, indent=4) if payload_type == "metamanager" else payload
+        return {"MNET_ID": MNET_ID, "STNS": metadata}
+
+    # metamanager
+    default_source = {"name": "Administration Console", "environment": str(MNET_ID)}
+    payload = {
+        "source":   source_info if source_info else default_source,
+        "metadata": metadata,
+    }
+    return json.dumps(payload, indent=4)
+
 
 
 def update_stations(url: str, headers: dict, payload: str) -> requests.Response:
-    """
-    Sends a PUT request to update station data.
+    """Send a PUT request to update station data."""
+    return requests.request("PUT", url, headers=headers, data=payload)
 
-    Args:
-        url (str): The URL to send the request to.
-        headers (dict): The headers to include in the request.
-        payload (str): The payload data in JSON format.
 
-    Returns:
-        requests.Response: The response from the server.
-    """
-    response = requests.request("PUT", url, headers=headers, data=payload)
-    return response
-
-# Function to save data to a JSON file
-def save_to_json(data, filename):
+def save_to_json(data, filename: str) -> None:
+    """Write *data* as indented JSON to *filename*, creating parent directories."""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
-    with open(filename, 'w') as f:
+    with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
 
 ########################################################################################################################
@@ -293,151 +342,203 @@ def main(event,context):
     core.setup_signal_handler(logger, args)
 
     logger.debug(f"ARGS LOADED from: {__file__}")
-    logger.debug(f"ENV at load time: DEV={os.getenv('DEV')} LOCAL_RUN={os.getenv('LOCAL_RUN')} LOG_LEVEL={os.getenv('LOG_LEVEL')}")
+    logger.debug(
+        f"ENV at load time: DEV={os.getenv('DEV')} "
+        f"LOCAL_RUN={os.getenv('LOCAL_RUN')} "
+        f"LOG_LEVEL={os.getenv('LOG_LEVEL')}"
+    )
     logger.debug(vars(args))
     
     start_runtime = time.time()
+    s3_bucket_name = None   # defined early so finally block can reference it safely
+
     try:
         # Declare S3 Paths for Metadata Storage
         s3_bucket_name = os.environ.get('INTERNAL_BUCKET_NAME')
         if not s3_bucket_name:
-            raise ValueError("Missing INTERNAL_BUCKET_NAME env var.")
+            raise ValueError("Missing required env var: INTERNAL_BUCKET_NAME")
 
         s3_meta_work_dir = "metadata"
         s3_station_meta_file = posixpath.join(s3_meta_work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
         # Declare Local Paths
-        work_dir = '/tmp/tmp/'
         os.makedirs(work_dir, exist_ok=True)
         station_meta_file = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
-        # Load Existing Stations and Payload Files
-        existing_stations = {}
+        # load existing stations from S3 
+        # We must never default to {} here.  If the download fails we raise
+        # immediately — proceeding with an empty dict would silently overwrite
+        # all previously-assigned SYNOPTIC_STIDs.
+        existing_stations: dict = {}
         try:
             aws.S3.download_file(bucket=s3_bucket_name, object_key=s3_station_meta_file, local_directory=work_dir)
             with open(station_meta_file, 'r', encoding='utf-8') as json_file:
                 existing_stations = json.load(json_file)
-            logger.info(f"Loaded {len(existing_stations)} existing stations")
+            logger.info(f"STATION META: loaded {len(existing_stations)} existing stations from S3")
         except FileNotFoundError:
-            logger.info("No existing station metadata found")
+            logger.info("STATION META: no existing file found in S3 — first run assumed")
         except Exception as e:
-            logger.warning(f"Failed to load existing station metadata: {e}")
+            # Any other failure (network, malformed JSON, …) is a hard error
+            logger.error(f"STATION META: failed to load from S3: {e}")
+            raise RuntimeError(
+                f"Cannot proceed: failed to load existing station metadata: {e}"
+            ) from e
+
         ########################################################################################################################
         # Fetch Metadata
-        ########################################################################################################################
+        ########################################################################################################################        raw_data = fetch_hko_station_metadata_raw()
         raw_data = fetch_hko_station_metadata_raw()
 
-        # Build station_meta dict
-        station_meta = {}
-        for station_id, info in raw_data.items():
-            existing = existing_stations.get(station_id, {})
-            station_meta[station_id] = {
-                "SYNOPTIC_STID": existing.get("SYNOPTIC_STID") or f"{STID_PREFIX}{station_id}",
+        if not raw_data:
+            logger.warning(
+                "META FETCH: returned 0 stations — "
+                "skipping merge to avoid overwriting existing data"
+            )
+            # Do not raise; let the run complete so logs are uploaded
+            return
+
+        # ── MERGE scraped stations INTO existing_stations ─────────────────
+        #
+        # Rules:
+        #   • SYNOPTIC_STID is immutable — never overwrite if already set.
+        #   • Mutable fields (NAME, LAT, LON, OTID, ELEVATION) are updated
+        #     from the fresh scrape.
+        #   • Stations absent from today's scrape are retained as-is.
+        #   • Restriction flags default from constants but are preserved if
+        #     already set in existing_stations.
+        new_count     = 0
+        updated_count = 0
+
+        station_meta: dict = dict(existing_stations)  # start from the full existing set
+
+        for code, info in raw_data.items():
+            existing = existing_stations.get(code, {})
+            is_new   = code not in existing_stations
+
+            # Assign SYNOPTIC_STID only on first appearance
+            synoptic_stid = existing.get("SYNOPTIC_STID") or f"{STID_PREFIX}{code}"
+
+            station_meta[code] = {
+                "SYNOPTIC_STID": synoptic_stid,
                 "NAME": info["NAME"],
                 "LAT": info["LAT"],
                 "LON": info["LON"],
                 "OTID": info["OTID"],
                 "ELEVATION": info.get("ELEVATION"),
-                "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
-                "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS,
+                # Preserve any existing restriction overrides; fall back to constants
+                "RESTRICTED_DATA":     existing.get("RESTRICTED_DATA",    RESTRICTED_DATA_STATUS),
+                "RESTRICTED_METADATA": existing.get("RESTRICTED_METADATA", RESTRICTED_METADATA_STATUS),
             }
 
-        # Generate payload
-        station_lookup_payload = generate_metadata_payload(station_meta=station_meta, payload_type='station_lookup')
+            if is_new:
+                new_count += 1
+            else:
+                updated_count += 1
 
-        # Save locally and upload to S3 (mocked here)
-        # save_to_json(station_meta, local_meta_path)
-        # aws.S3.upload_file(...)
+        retained_count = len(existing_stations) - (len(raw_data) - new_count)
+        logger.info(
+            f"MERGE: {new_count} new, {updated_count} updated, "
+            f"{retained_count} retained (absent from today's scrape), "
+            f"{len(station_meta)} total"
+        )
 
-        # Further processing...
+        # ── GENERATE payload ──────────────────────────────────────────────
+        station_lookup_payload = generate_metadata_payload(
+            station_meta=station_meta,
+            payload_type='station_lookup',
+        )
 
-        #print(f"Completed in {time.time() - start_time} seconds")
-        # SAVE TO LOCAL DEV (if local_run)
+        # ── DEV: persist locally and exit early ───────────────────────────
         if args.local_run:
             dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../dev'))
             os.makedirs(dev_dir, exist_ok=True)
 
-            # Save station_meta locally
-            station_meta_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_stations_metadata.json')
-            with open(station_meta_dev_path, 'w') as f:
-                json.dump(station_meta, f, indent=4)
+            meta_dev_path   = os.path.join(dev_dir, f'{INGEST_NAME}_stations_metadata.json')
+            lookup_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_station_lookup_payload.json')
+            with open(meta_dev_path, 'w') as fh:
+                json.dump(station_meta, fh, indent=4)
+            with open(lookup_dev_path, 'w') as fh:
+                json.dump(station_lookup_payload, fh, indent=4)
 
-            # Save station_lookup_payload locally
-            lookup_payload_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            with open(lookup_payload_dev_path, 'w') as f:
-                json.dump(station_lookup_payload, f, indent=4)
+            logger.debug(f"[DEV] station_meta → {meta_dev_path} ({len(station_meta)} stations)")
+            logger.debug(f"[DEV] station_lookup_payload → {lookup_dev_path}")
+            logger.info("DONE (local run — skipping station_lookup and S3 uploads)")
+            return
 
-            logger.debug(f"[DEV] Saved station_meta to {station_meta_dev_path}")
-            logger.debug(f"[DEV] Saved station_lookup_payload to {lookup_payload_dev_path}")
-            logger.debug(f"[DEV] Station count: {len(station_meta)}")
+        # ── PRODUCTION: station_lookup + S3 persist ───────────────────────
+        logger.debug("PROD: calling station_lookup.load_metamgr")
+        try:
+            station_lookup.load_metamgr(station_lookup_payload, logstream=logger, mode='prod', output_location=work_dir)
+            logger.debug("PROD: station_lookup.load_metamgr completed")
+        except Exception as e:
+            logger.exception(f"PROD: station_lookup failed: {e}")
+            raise
 
-        if not args.local_run:
-            try:
-                logger.debug('production station lookup proceeding')
-                station_lookup.load_metamgr(station_lookup_payload, logstream=logger, mode='prod', output_location=work_dir)
-                logger.debug('past station lookup')
-            except Exception as e:
-                logger.exception(f"Station lookup failed: {e}")
-                raise
+        # --------------- 5. DATA PERSISTENCE ---------------
 
-            # --------------- 5. DATA PERSISTENCE ---------------
+        # Save and upload station_meta
+        save_to_json(data=station_meta, filename=station_meta_file)
+        aws.S3.upload_file(
+            local_file_path=station_meta_file,
+            bucket=s3_bucket_name,
+            s3_key=s3_station_meta_file
+        )
+        logger.info(f"PROD: station_meta uploaded to s3://{s3_bucket_name}/{s3_station_meta_file}")
 
-            # Save and upload station_meta
-            save_to_json(data=station_meta, filename=station_meta_file)
+        # Persist station_lookup_payload
+        lookup_file = os.path.join(work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
+        save_to_json(data=station_lookup_payload, filename=lookup_file)
+        s3_lookup_key = posixpath.join(s3_meta_work_dir,
+                                       f'{INGEST_NAME}_station_lookup_payload.json')
+        aws.S3.upload_file(
+            local_file_path=lookup_file,
+            bucket=s3_bucket_name,
+            s3_key=s3_lookup_key,
+        )
+
+        # Upload generated SQL files
+        deleted_sql = aws.S3.delete_files(
+            bucket=s3_bucket_name,
+            prefix=s3_meta_work_dir,
+            endswith=".sql",
+        )
+        logger.debug(f"PROD: deleted {deleted_sql} old SQL files from S3")
+
+        for file_name in os.listdir(work_dir):
+            if not file_name.endswith(".sql"):
+                continue
+            sql_local  = os.path.join(work_dir, file_name)
+            s3_sql_key = posixpath.join(
+                os.path.dirname(s3_station_meta_file),
+                os.path.basename(sql_local),
+            )
             aws.S3.upload_file(
-                local_file_path=station_meta_file,
+                local_file_path=sql_local,
                 bucket=s3_bucket_name,
-                s3_key=s3_station_meta_file
+                s3_key=s3_sql_key,
             )
+            logger.debug(f"PROD: uploaded SQL {file_name} → s3://{s3_bucket_name}/{s3_sql_key}")
 
-            # Save and upload station_lookup_payload
-            station_lookup_file = os.path.join(work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            save_to_json(data=station_lookup_payload, filename=station_lookup_file)
-            s3_lookup_key = os.path.join(s3_meta_work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            aws.S3.upload_file(
-                local_file_path=station_lookup_file,
-                bucket=s3_bucket_name,
-                s3_key=s3_lookup_key
-            )
-
-            # Clean up old SQL files
-            deleted_files_count = aws.S3.delete_files(
-                bucket=s3_bucket_name,
-                prefix=s3_meta_work_dir,
-                endswith=".sql"
-            )
-            logger.debug(f"Deleted {deleted_files_count} SQL files from the bucket {s3_bucket_name}")
-            for file_name in os.listdir(work_dir):
-                if file_name.endswith(".sql"):
-                    # Get the full path of the SQL file
-                    sql_updates = os.path.join(work_dir, file_name)
-                    
-                    # Get the path portion of the s3_key (without the file name)
-                    s3_key_path = os.path.dirname(s3_station_meta_file)
-                    
-                    # Manually join the S3 path and the new SQL file name
-                    s3_sql = f"{s3_key_path}/{os.path.basename(sql_updates)}"
-                    
-                    # Upload the SQL file to S3
-                    aws.S3.upload_file(local_file_path=sql_updates, 
-                                    bucket=s3_bucket_name, 
-                                    s3_key=s3_sql)
-
-        logger.info(msg=json.dumps({'completion': 1, 'time': time.time() - start_runtime}))
-        
+        logger.info(msg=json.dumps({'completion': 1, 'time': round(time.time() - start_runtime, 2)}))
 
     except Exception as e:
-        logger.error(msg=json.dumps({'completion': 0, 'time': time.time() - start_runtime}))
+        logger.error(msg=json.dumps({'completion': 0, 'time': round(time.time() - start_runtime, 2)}))
         raise 
         
     finally:
         total_runtime = time.time() - start_runtime
         logger.info(f"Total execution time: {total_runtime:.2f} seconds")
 
-
-        # 2) prod only: upload the *exact* file we just wrote
-        if (not args.local_run) and (not args.dev) and log_file and s3_bucket_name:
+        # Upload log in prod only
+        if not (args.local_run or args.dev) and log_file and s3_bucket_name:
             s3_log_key = posixpath.join(s3_work_dir, f"{INGEST_NAME}_meta.log")
-            aws.S3.upload_file(local_file_path=log_file, bucket=s3_bucket_name, s3_key=s3_log_key)
+            try:
+                aws.S3.upload_file(
+                    local_file_path=log_file,
+                    bucket=s3_bucket_name,
+                    s3_key=s3_log_key,
+                )
+            except Exception as e:
+                logger.warning(f"LOG UPLOAD: failed — {e}")
         
         logging.shutdown()
