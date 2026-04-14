@@ -4,128 +4,88 @@ from aws_cdk import (
     Stack,
     aws_lambda as _lambda,
     aws_iam as iam,
-    aws_sqs as sqs,
-    aws_lambda_destinations as destinations,
-    aws_lambda_event_sources as event_sources,
-    aws_secretsmanager as sm,
-    BundlingOptions,
-    DockerImage, Duration,
     aws_ec2 as ec2,
-    aws_events_targets as targets,
     aws_events as events,
+    aws_events_targets as targets,
     aws_logs as logs,
-    Size
+    Duration,
 )
 
-class {INGEST_NAME}ObsLambda(Stack):
 
-    def __init__(self, scope: Construct, id: str, lambda_env: dict, config: dict, **kwargs) -> None:
-        super().__init__(scope, id, description=f"Lambda function to process {INGEST_NAME} Data", **kwargs)
+class ObsLambdaStack(Stack):
 
-        # Using values from config
-        vpc_id = config.get('vpc_id')
-        subnet_ids = config.get('vpc_subnet_id')
+    def __init__(self, scope: Construct, id: str, *, lambda_env: dict,
+                 config: dict, ingest_name: str, display_name: str = None, **kwargs) -> None:
+        super().__init__(scope, id,
+                         description=f"{ingest_name} obs Lambda",
+                         **kwargs)
+        display_name = display_name or ingest_name
 
-        # Retrieve VPC from config
-        vpc = ec2.Vpc.from_lookup(self, "vpc", vpc_id=vpc_id, is_default=False)
+        # ── Networking ─────────────────────────────────────────
+        vpc = ec2.Vpc.from_lookup(self, "vpc",
+                                  vpc_id=config["vpc_id"],
+                                  is_default=False)
+        subnet_filter = ec2.SubnetFilter.by_ids(config["subnet_ids"])
 
-        # Use the subnet from the config
-        subnet_filter = ec2.SubnetFilter.by_ids(subnet_ids)
-        # {INGEST_NAME} Obs Lambda Role
-        {INGEST_NAME}_lambda_role = iam.Role(self, "{INGEST_NAME}LambdaRole",
-                                    assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-                                    description="Role for {INGEST_NAME} Lambda",
-                                    managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
-                                        "service-role/AWSLambdaBasicExecutionRole")])
-
-        # s3 permissions
-        ingest_s3_bucket_names = config.get('ingest_s3_bucket_arn')
-        cache_s3_bucket_names = config.get('cache_s3_bucket_arn')
-        print(ingest_s3_bucket_names)
-        print(cache_s3_bucket_names)
-        # combine bucket names into one list
-        bucket_names = [arn for bucket_list in [ingest_s3_bucket_names, cache_s3_bucket_names] if bucket_list is not None for arn in bucket_list]
-
-        # s3 permissions
-        {INGEST_NAME}_lambda_role.add_to_policy(iam.PolicyStatement(
-            effect=iam.Effect.ALLOW,
-            actions=[
-                "s3:GetObject", 
-                "s3:PutObject", 
-                "s3:HeadObject", 
-                "s3:ListBucket",
-                "s3:DeleteObject", 
-                "s3:GetObjectAcl", 
-                "s3:PutObjectAcl"
+        # ── IAM role ───────────────────────────────────────────
+        role = iam.Role(self, "ObsRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description=f"{ingest_name} obs Lambda role",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"),
             ],
-            resources=bucket_names
-        ))
-
-        # ENI permissions
-        # Create, Delete and Describe NetworkInterfaces
-        {INGEST_NAME}_lambda_role.add_to_policy(iam.PolicyStatement(
-            effect=iam.Effect.ALLOW,
-            actions=["ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface","ec2:CreateTags"],
-            resources=["*"]
-        ))
-
-        # secrets manager
-        {INGEST_NAME}_lambda_role.add_to_policy(iam.PolicyStatement(
-            effect=iam.Effect.ALLOW,
-            actions=[
-                "secretsmanager:GetSecretValue",
-                "secretsmanager:DescribeSecret",
-                "secretsmanager:ListSecrets"
-            ],
-            resources=["*"]
-        ))
-
-        # Defines an AWS Lambda resource
-        {INGEST_NAME}_lambda  = _lambda.DockerImageFunction(
-                    scope=self,
-                    id="{INGEST_NAME}ObsLambda",
-                    # Function name on AWS
-                    function_name="{INGEST_NAME}ObsLambda",
-                    memory_size=256,
-                    #ephemeral_storage_size=Size.gibibytes(5),
-                    role={INGEST_NAME}_lambda_role,
-                    architecture=_lambda.Architecture.ARM_64,
-                    timeout=Duration.minutes(15),
-                    environment=lambda_env,
-                    tracing=_lambda.Tracing.ACTIVE,
-                    # Use aws_cdk.aws_lambda.DockerImageCode.from_image_asset to build
-                    # a docker image on deployment
-                    code=_lambda.DockerImageCode.from_image_asset(
-                        # Directory relative to where you execute cdk deploy
-                        # contains a Dockerfile
-                        directory="../obs-lambda/",
-                        build_ssh="default",
-                        platform=Platform.LINUX_ARM64,
-                    ),
-                    vpc=vpc,
-                    vpc_subnets=ec2.SubnetSelection(subnet_filters=[subnet_filter]),
-                    allow_public_subnet=True,
-                    log_retention=logs.RetentionDays.ONE_MONTH
-                )
-
-
-
-        # Create a rule in CloudWatch Events
-        rule = events.Rule(
-            self, "{INGEST_NAME}ObsLambdaRule",
-            schedule=events.Schedule.cron(minute='*/5'),  # This will run the Lambda every 5 minutes
         )
-        # rule = events.Rule(
-        #     self, "NasaGlobeMetaLambdaRule",
-        #     schedule=events.Schedule.cron(week_day="MON",
-        #         hour="0",
-        #         minute="0"),  # This will run the Lambda every Monday at midnight
-        # )
-        # Add the Lambda function as a target to the rule
-        rule.add_target(targets.LambdaFunction(
-            {INGEST_NAME}_lambda,
-            retry_attempts=0  # This will prevent retries on timeout
+
+        role.add_to_policy(iam.PolicyStatement(
+            actions=["s3:GetObject", "s3:PutObject", "s3:HeadObject",
+                     "s3:ListBucket", "s3:DeleteObject"],
+            resources=config["s3_bucket_arns"],
         ))
-        # {INGEST_NAME}_lambda.add_event_source(event_source)
-        # event_source_id = event_source.event_source_mapping_id
-        # event_source_mapping_arn = event_source.event_source_mapping_arn
+        role.add_to_policy(iam.PolicyStatement(
+            actions=["ec2:CreateNetworkInterface",
+                     "ec2:DescribeNetworkInterfaces",
+                     "ec2:DeleteNetworkInterface",
+                     "ec2:CreateTags"],
+            resources=["*"],
+        ))
+        role.add_to_policy(iam.PolicyStatement(
+            actions=["secretsmanager:GetSecretValue",
+                     "secretsmanager:DescribeSecret"],
+            resources=["*"],
+        ))
+
+        # ── Lambda ─────────────────────────────────────────────
+        fn = _lambda.DockerImageFunction(self, "ObsFn",
+            function_name=f"{display_name}ObsLambda",
+            memory_size=config["obs_memory_mb"],
+            timeout=Duration.minutes(config["obs_timeout_min"]),
+            reserved_concurrent_executions=config.get("obs_concurrency"),
+            role=role,
+            architecture=_lambda.Architecture.ARM_64,
+            environment=lambda_env,
+            tracing=_lambda.Tracing.ACTIVE,
+            code=_lambda.DockerImageCode.from_image_asset(
+                directory="../",
+                file="deploy/Dockerfile",
+                build_ssh="default",
+                platform=Platform.LINUX_ARM64,
+                exclude=["deploy/cdk.out", "deploy/.venv", "env", ".venv",
+                        "dev", ".git", "__pycache__", "tests", "legacy"],
+            ),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_filters=[subnet_filter]),
+            allow_public_subnet=True,
+            log_group=logs.LogGroup(self, "ObsLogGroup",
+                log_group_name=f"/aws/lambda/{display_name}ObsLambda",
+                retention=logs.RetentionDays.ONE_MONTH,
+            ),
+        )
+
+        # ── Event source ───────────────────────────────────────
+        if config["obs_event_source"] == "schedule":
+            rule = events.Rule(self, "ObsSchedule",
+                schedule=events.Schedule.rate(
+                    Duration.minutes(config["obs_schedule_minutes"])),
+            )
+            rule.add_target(targets.LambdaFunction(fn, retry_attempts=0))

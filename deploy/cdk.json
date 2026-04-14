@@ -64,3 +64,4 @@
     "@aws-cdk/aws-kms:reduceCrossAccountRegionPolicyScope": true
   }
 }
+
