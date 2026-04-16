@@ -1,5 +1,5 @@
 """
-test_meta_handler.py — Run the Taiwan metadata ingest locally.
+test_meta_handler.py — Run the Hong Kong metadata ingest locally.
 
 Usage: python test_meta_handler.py --local|--dev|--prod
 """
@@ -7,7 +7,7 @@ import os, sys, json, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import INGEST_S3_BUCKET, NAME
 
-_ap = argparse.ArgumentParser(description="Run Taiwan metadata ingest locally")
+_ap = argparse.ArgumentParser(description="Run Hong Kong metadata ingest locally")
 _mode = _ap.add_mutually_exclusive_group(required=True)
 _mode.add_argument("--local", action="store_true")
 _mode.add_argument("--dev", action="store_true")
@@ -16,7 +16,7 @@ _test_flags, _ = _ap.parse_known_args()
 
 os.environ["AWS_PROFILE"] = "ingest"
 os.environ["LOG_LEVEL"] = "DEBUG"
-os.environ["INTERNAL_BUCKET_NAME"] = INGEST_S3_BUCKET
+os.environ["INTERNAL_BUCKET_NAME"] = "synoptic-ingest-hongkong-hko726"
 os.environ["AWS_REGION"] = "us-west-2"
 
 if _test_flags.prod:
@@ -45,4 +45,4 @@ if __name__ == "__main__":
         response = lambda_handler(fake_event, fake_context)
         print(f"\nLambda response: {json.dumps(response, indent=2)}")
     else:
-        result = TaiwanMeta().run()
+        result = HongKongMeta().run()

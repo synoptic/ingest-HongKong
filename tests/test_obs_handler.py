@@ -1,8 +1,10 @@
-
 """
-test_obs_handler.py — Run the Taiwan obs ingest locally.
+test_obs_handler.py — Run the Hong Kong obs ingest locally.
 
-Usage: python test_obs_handler.py [--full] [--lambda]
+Usage:
+    python test_obs_handler.py            # local mode
+    python test_obs_handler.py --full     # dev mode (S3 + DB)
+    python test_obs_handler.py --lambda   # simulate Lambda
 """
 import os, sys, json, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -26,6 +28,8 @@ elif _test_flags.full:
     os.environ["MODE"] = "dev"
 else:
     os.environ["MODE"] = "local"
+    os.environ["LOCAL_RUN"] = "True"   # keep your new flag
+# ── Import AFTER env is set (important for Args/local detection) ──
 
 from handlers.obs_handler import HongKongIngest, lambda_handler
 
@@ -42,6 +46,26 @@ if __name__ == "__main__":
         print("SIMULATING LAMBDA INVOCATION")
         print("=" * 60)
         response = lambda_handler(fake_event, fake_context)
-        print(f"\nLambda response: {json.dumps(response, indent=2)}")
+        print(f"\nLambda response:\n{json.dumps(response, indent=2)}")
+
+    # ── Local / Dev Execution ────────────────────────────────────
     else:
+        # Optional safety check (your new addition, but cleaner)
+        if os.environ["MODE"] == "local":
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            meta_file = os.path.join(root_dir, "dev", "hongkong_stations_metadata.json")
+
+            if not os.path.exists(meta_file):
+                print(f"ERROR: Metadata file missing at {meta_file}")
+                print("Run metadata ingest locally first.")
+                sys.exit(1)
+
+        print("=" * 60)
+        print(f"RUNNING HongKongIngest (MODE={os.environ['MODE']})")
+        print("=" * 60)
+
         result = HongKongIngest().run()
+
+        print("\n" + "=" * 60)
+        print("RESULT:", "SUCCESS" if result else "FAILED")
+        print("=" * 60)

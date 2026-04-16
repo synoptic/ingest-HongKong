@@ -93,7 +93,7 @@ MetaStack(
 )
 
 # DEPLOYMENT
-# BUILDX_NO_DEFAULT_ATTESTATIONS=1 cdk deploy TaiwanObsLambda --profile ingest
-# BUILDX_NO_DEFAULT_ATTESTATIONS=1 cdk deploy TaiwanMetaLambda --profile ingest
+# BUILDX_NO_DEFAULT_ATTESTATIONS=1 cdk deploy HongKongObsLambda --profile ingest
+# BUILDX_NO_DEFAULT_ATTESTATIONS=1 cdk deploy HongKongMetaLambda --profile ingest
 
 app.synth()

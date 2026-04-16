@@ -3,14 +3,15 @@ Hong Kong HKO metadata ingest
 
 Scrapes station metadata from the HKO station list page,
 converts DMS coordinates to decimal, and registers with station_lookup.
+Supports local mode + safe STID generation.
 """
 
 import re
 import json
 import time
-import math
 import logging
 import requests
+import os
 from bs4 import BeautifulSoup
 
 from ingestlib.metadata import MetadataIngest
@@ -24,6 +25,28 @@ HKO_STATION_URL = "https://www.hko.gov.hk/en/cis/stn.htm"
 
 _META_MAX_RETRIES = 3
 _META_BACKOFF     = 2.0  # seconds; wait = backoff * attempt
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _normalize_code(code: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", code).upper()
+
+
+def _build_stid(code: str, assigned: set, prefix: str) -> str:
+    base = f"{prefix}{code}"
+    stid = base[:10]
+
+    if stid not in assigned:
+        return stid
+
+    for i in range(1, 100):
+        suffix = str(i)
+        trimmed = base[: 10 - len(suffix)]
+        candidate = f"{trimmed}{suffix}"
+        if candidate not in assigned:
+            return candidate
+
+    raise RuntimeError(f"Unable to generate unique STID for {code}")
 
 
 def _dms_to_decimal(dms_str: str) -> float | None:
@@ -57,10 +80,11 @@ def _dms_to_decimal(dms_str: str) -> float | None:
         return None
 
 
+# ── Fetch  ────────────────────────────────────
+
 def fetch_hko_station_metadata(logger: logging.Logger) -> dict:
     """
-    Scrape the HKO station list page and return a dict keyed by station code.
-
+    Fetch + parse HKO station metadata (with retries).
     Retries up to _META_MAX_RETRIES times with exponential back-off.
 
     Each entry::
@@ -81,17 +105,13 @@ def fetch_hko_station_metadata(logger: logging.Logger) -> dict:
             break
         except Exception as e:
             wait = _META_BACKOFF * attempt
-            logger.warning(
-                f"ACQUIRE: attempt {attempt}/{_META_MAX_RETRIES} failed — {e}; "
-                f"retrying in {wait:.1f}s"
-            )
             if attempt < _META_MAX_RETRIES:
                 time.sleep(wait)
             else:
-                logger.error(f"ACQUIRE: all attempts exhausted for {HKO_STATION_URL}")
+                logger.error("ACQUIRE: all retries failed")
                 return {}
 
-    out: dict = {}
+    out = {}
     skipped = 0
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -111,42 +131,34 @@ def fetch_hko_station_metadata(logger: logging.Logger) -> dict:
                 if not match:
                     continue
 
-                code = match.group(1).strip()
+                code = _normalize_code(match.group(1))
                 name = name_cell.split("(")[0].strip()
 
                 lat = _dms_to_decimal(cols[1].get_text(strip=True))
                 lon = _dms_to_decimal(cols[2].get_text(strip=True))
 
                 if lat is None or lon is None:
-                    logger.debug(
-                        f"ACQUIRE: skipping '{name}' ({code}) — "
-                        f"unparseable coordinates"
-                    )
                     skipped += 1
                     continue
 
-                elevation: float | None = None
+                elevation = None
                 try:
                     elevation = float(cols[3].get_text(strip=True))
-                except (ValueError, TypeError):
+                except Exception:
                     pass
 
                 out[code] = {
-                    "NAME":      name,
-                    "LATITUDE":  lat,
+                    "NAME": name,
+                    "LATITUDE": lat,
                     "LONGITUDE": lon,
-                    "OTHER_ID":  code,
                     "ELEVATION": elevation,
+                    "OTHER_ID": code,
                 }
 
-            except Exception as e:
-                logger.debug(f"ACQUIRE: skipping row — {e}")
+            except Exception:
                 skipped += 1
 
-    logger.info(
-        f"ACQUIRE: scraped {len(out)} stations "
-        f"({skipped} rows skipped due to parse errors)"
-    )
+    logger.info(f"ACQUIRE: scraped {len(out)} stations ({skipped} skipped)")
     return out
 
 
@@ -158,13 +170,38 @@ class HongKongMeta(MetadataIngest):
     STID_PREFIX    = STID_PREFIX
     ELEVATION_UNIT = INCOMING_ELEVATION_UNIT
 
+    # ── Local mode helpers ───────────────────────────────────────
+
+    def _is_local(self) -> bool:
+        return os.environ.get("MODE") == "local"
+
+    # ── Setup ───────────────────────────────────────────────────
+
     def setup(self):
-        """No auth key required — HKO station page is public."""
-        self.logger.info("SETUP: HKO station page is public, no auth required")
+        if self._is_local():
+            self.logger.info("SETUP: LOCAL mode")
+
+            path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "dev",
+                f"{self.NAME}_stations_metadata.json",
+            )
+
+            if os.path.exists(path):
+                with open(path) as f:
+                    self.existing_stations = json.load(f)
+                self.logger.info(f"Loaded {len(self.existing_stations)} stations (local)")
+            else:
+                self.existing_stations = {}
+        else:
+            super().setup()
+
+    # ── Acquire (OLD STYLE CALL) ────────────────────────────────
 
     def acquire(self):
-        """Scrape HKO station metadata page."""
         return fetch_hko_station_metadata(self.logger)
+
+    # ── Parse  ──────────────────────────────────
 
     def parse(self, raw_data: dict) -> dict:
         """
@@ -177,17 +214,26 @@ class HongKongMeta(MetadataIngest):
           - Stations absent from today's scrape are retained as-is.
         """
         station_meta = dict(self.existing_stations)
+
+        assigned_stids = {
+            s.get("SYNOPTIC_STID")
+            for s in self.existing_stations.values()
+            if s.get("SYNOPTIC_STID")
+        }
+
         new_count     = 0
         updated_count = 0
 
         for code, info in raw_data.items():
-            existing = self.existing_stations.get(code, {})
-            is_new   = code not in self.existing_stations
+            existing = self.existing_stations.get(code)
+            is_new = existing is None
 
-            # SYNOPTIC_STID is immutable — only assigned on first appearance
-            synoptic_stid = (
-                existing.get("SYNOPTIC_STID") or f"{self.STID_PREFIX}{code}"
-            )
+            if existing and existing.get("SYNOPTIC_STID"):
+                synoptic_stid = existing["SYNOPTIC_STID"]
+            else:
+                synoptic_stid = _build_stid(code, assigned_stids, self.STID_PREFIX)
+
+            assigned_stids.add(synoptic_stid)
 
             station_meta[code] = {
                 "SYNOPTIC_STID": synoptic_stid,
@@ -195,7 +241,7 @@ class HongKongMeta(MetadataIngest):
                 "LATITUDE":      info["LATITUDE"],
                 "LONGITUDE":     info["LONGITUDE"],
                 "ELEVATION":     info.get("ELEVATION"),
-                "OTHER_ID":      info["OTHER_ID"],
+                "OTHER_ID":      code,
             }
 
             if is_new:
@@ -203,18 +249,38 @@ class HongKongMeta(MetadataIngest):
             else:
                 updated_count += 1
 
-        retained_count = len(self.existing_stations) - (len(raw_data) - new_count)
         self.logger.info(
-            f"PARSE: {new_count} new, {updated_count} updated, "
-            f"{retained_count} retained (absent from today's scrape), "
-            f"{len(station_meta)} total"
+            f"PARSE: {new_count} new, {updated_count} updated, {len(station_meta)} total"
         )
         return station_meta
 
+    # ── Save ────────────────────────────────────────────────────
 
-# ── Entry points ───────────────────────────────────────────────────
+    def save_station_meta(self, station_meta: dict):
+        if self._is_local():
+            path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "dev",
+                f"{self.NAME}_stations_metadata.json",
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            with open(path, "w") as f:
+                json.dump(station_meta, f, indent=4)
+
+            self.logger.info(f"LOCAL SAVE: wrote {len(station_meta)} stations")
+        else:
+            super().save_station_meta(station_meta)
+
+
+# ── Entry points ─────────────────────────────────────────────────
 
 lambda_handler = make_lambda_handler(HongKongMeta)
 
 if __name__ == "__main__":
+    import sys
+
+    if "--local" in sys.argv:
+        os.environ["MODE"] = "local"
+
     HongKongMeta().run()

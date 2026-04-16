@@ -20,6 +20,7 @@ import json
 import time
 import logging
 import requests
+import os
 import posixpath
 from io import StringIO
 from datetime import datetime, timezone, timedelta
@@ -238,10 +239,134 @@ class HongKongIngest(Ingest):
     HOURS_TO_RETAIN = 12
     CACHE_RAW_DATA  = True
 
+    def __init__(self, *args, **kwargs):
+        if self._is_local():
+            import os
+            os.environ['INTERNAL_BUCKET_NAME'] = ''
+        super().__init__(*args, **kwargs)
+        if self._is_local():
+            self.load_station_meta()
+            self.load_seen_obs()
+
+    def _is_local(self) -> bool:
+        """Check if running in local mode via args or environment variable."""
+        # Try to check args.local_run first (set by MODE=local)
+        # Import lazily to ensure environment variables are already set
+        try:
+            from args import Args
+            args_instance = Args()
+            if hasattr(args_instance, 'local_run'):
+                return args_instance.local_run
+        except (ImportError, Exception):
+            pass
+        
+        # Fallback to environment variables (in order of priority)
+        # MODE=local (from args configuration)
+        if os.environ.get("MODE") == "local":
+            return True
+        
+        return False
+
+    def _load_local_state(self):
+        """Load seen_obs and station_meta from local dev directory for local runs."""
+        work_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dev')
+        
+        # Load seen_obs
+        seen_path = os.path.join(work_dir, 'seen_obs.txt')
+        self.seen_obs = set()
+        if os.path.exists(seen_path):
+            with open(seen_path, 'r') as f:
+                for line in f:
+                    self.seen_obs.add(line.strip())
+            self.logger.info(f"LOCAL STATE: Loaded {len(self.seen_obs)} seen observations from {seen_path}")
+        else:
+            self.logger.info("LOCAL STATE: No seen_obs.txt found, starting with empty set")
+        
+        # Load station_meta
+        meta_path = os.path.join(work_dir, 'station_meta.json')
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                self.station_meta = json.load(f)
+            self.logger.info(f"LOCAL STATE: Loaded station metadata from {meta_path} with {len(self.station_meta)} stations")
+        else:
+            self.station_meta = {}
+            self.logger.warning("LOCAL STATE: No station_meta.json found, starting with empty metadata")
+
     def setup(self):
         """Load variables — HKO endpoints are public, no auth required."""
         self.variables = variables
         self.logger.debug("SETUP: HKO endpoints are public, no auth required")
+
+    def load_seen_obs(self):
+        """Load seen_obs from S3 or local."""
+        if self._is_local():
+            seen_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dev', 'seen_obs.txt')
+            self.seen_obs = {}
+            if os.path.exists(seen_path):
+                with open(seen_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                # Parse STID|dattim|json_data format
+                                parts = line.split('|', 2)
+                                if len(parts) == 3:
+                                    key = f"{parts[0]}|{parts[1]}"
+                                    data = parts[2]
+                                    self.seen_obs[key] = data
+                                else:
+                                    # Fallback for old format (just key)
+                                    self.seen_obs[line] = '{}'
+                            except Exception as e:
+                                self.logger.warning(f"Failed to parse seen_obs line: {line} - {e}")
+                self.logger.info(f"LOCAL STATE: Loaded {len(self.seen_obs)} seen observations from {seen_path}")
+            else:
+                self.logger.info("LOCAL STATE: No seen_obs.txt found, starting with empty dict")
+        else:
+            super().load_seen_obs()
+
+    def save_seen_obs(self):
+        """Save seen_obs to local file in local mode."""
+        if self._is_local():
+            seen_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dev', 'seen_obs.txt')
+            with open(seen_path, 'w') as f:
+                for obs_key, obs_data in sorted(self.seen_obs.items()):
+                    f.write(f"{obs_key}|{obs_data}\n")
+            self.logger.info(f"LOCAL STATE: Saved {len(self.seen_obs)} seen observations to {seen_path}")
+        else:
+            super().save_seen_obs()
+
+    def update_seen_obs(self, grouped_obs_set):
+        """Update seen_obs with processed observations."""
+        if self._is_local():
+            for obs_key, obs_data in grouped_obs_set.items():
+                # Convert the data dict to JSON string
+                json_str = json.dumps(obs_data, sort_keys=True)
+                self.seen_obs[obs_key] = json_str
+            self.logger.debug(f"LOCAL STATE: Updated seen_obs with {len(grouped_obs_set)} observations")
+            # Save immediately in local mode
+            self.save_seen_obs()
+
+    def load_station_meta(self):
+        """Load station_meta from S3 or local."""
+        self.logger.debug(f"[META] load_station_meta called, _is_local={self._is_local()}")
+        if self._is_local():
+            meta_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dev', 'station_meta.json')
+            self.logger.debug(f"[META] Loading local metadata from {meta_path}")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, 'r') as f:
+                        self.station_meta = json.load(f)
+                    self.logger.info(f"[META] ✓ Loaded station metadata from {meta_path} with {len(self.station_meta)} stations")
+                except Exception as e:
+                    self.logger.error(f"[META] ✗ Failed to load metadata: {e}")
+                    self.station_meta = {}
+            else:
+                self.logger.warning(f"[META] File not found: {meta_path}")
+                self.station_meta = {}
+        else:
+            self.logger.debug(f"[META] Production mode - calling super().load_station_meta()")
+            super().load_station_meta()
 
     def acquire(self):
         """Fetch all HKO CSV endpoints in parallel."""
@@ -255,6 +380,8 @@ class HongKongIngest(Ingest):
         name to a SYNOPTIC_STID via metadata, parses and converts the value,
         then merges into a grouped dict keyed by "STID|dattim".
         """
+        self.logger.debug(f"[PARSE] station_meta has {len(self.station_meta)} records")
+        
         name_to_stid = _build_name_to_stid_map(self.station_meta, self.logger)
         cutoff_dt    = datetime.now(timezone.utc) - timedelta(hours=self.HOURS_TO_RETAIN)
         counters     = defaultdict(int)
@@ -356,6 +483,11 @@ class HongKongIngest(Ingest):
             f"parse_error={counters['parse_error']}"
         )
         self.logger.debug(f"PARSE: {len(grouped_obs_set)} grouped observation records")
+        
+        # Update seen_obs with all processed observations in local mode
+        if self._is_local():
+            self.update_seen_obs(grouped_obs_set)
+        
         return grouped_obs_set
 
 
