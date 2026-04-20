@@ -19,6 +19,9 @@ variables = {
         "long_name": "The latest 10-minute mean wind direction and wind speed and maximum gust",
         "incoming_unit": "km/h",
         "final_unit": "m/s",
+        "var_dim": {"value": "10", 
+                    "unit": "minute", 
+                    "statistic": "mean"},
     },
     "wind_gust":{
         "vargem": "GUST",
@@ -26,6 +29,9 @@ variables = {
         "long_name": "The latest 10-minute maximum wind gust",
         "incoming_unit": "km/h",
         "final_unit": "m/s",
+        "var_dim": {"value": "10", 
+                    "unit": "minute", 
+                    "statistic": "max"},
     },
     "mean_pressure": {
         "vargem": "PMSL",
@@ -40,6 +46,9 @@ variables = {
         "long_name": "Global Solar Radiation (Daily)",
         "incoming_unit": "W/m²",
         "final_unit": "W/m²",
+        "var_dim": {"value": "24", 
+                    "unit": "hour", 
+                    "statistic": "mean"},
     },
     "diffuse_radiation": {
         "vargem": "DIFR",
@@ -47,6 +56,9 @@ variables = {
         "long_name": "Diffuse Radiation (Daily)",
         "incoming_unit": "W/m²",
         "final_unit": "W/m²",
+        "var_dim": {"value": "24", 
+                    "unit": "hour", 
+                    "statistic": "mean"},
     },  
     "grass_min_temp": {
         "vargem": "TMPG",
@@ -61,5 +73,8 @@ variables = {
         "long_name": "the latest 10-minute mean visibility",
         "incoming_unit": "km",
         "final_unit": "statutemile",
+        "var_dim": {"value": "10", 
+                    "unit": "minute", 
+                    "statistic": "mean"},
     },
 }
