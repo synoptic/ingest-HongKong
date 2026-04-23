@@ -2,7 +2,7 @@
 
 NAME = "hongkong" # Matches existing codebase naming convention
 DISPLAY_NAME = "HongKong" # For stack names, descriptions
-MNET_ID = 342 # Unique MNET ID for HKO (sequential after Taiwan's 328)
+MNET_ID = 346 # Unique MNET ID for HKO (sequential after Taiwan's 328)
 STID_PREFIX = "HKI" # T= Taiwan region prefix pattern, HKO for Hong Kong Observatory
 INCOMING_ELEVATION_UNIT = "METERS" # Standard for HKO AWS elevations
 
