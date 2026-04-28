@@ -61,7 +61,7 @@ variables = {
                     "statistic": "mean"},
     },  
     "grass_min_temp": {
-        "vargem": "TMPG",
+        "vargem": "GSMN",
         "VNUM": "1",
         "long_name": "the latest 1-minute mean grass temperature from 5:00 p.m. to 8:00 a.m. the following date Hong Kong time",
         "incoming_unit": "degC",
